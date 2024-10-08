@@ -1,0 +1,6 @@
+-r requirements.txt
+azure-mgmt-web
+azure-identity
+azure-mgmt-resource
+azure-graphrbac
+msgraph-core

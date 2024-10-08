@@ -1,0 +1,23 @@
+# Ignore the virtual environment
+venv/
+.venv/
+
+# Ignore Git files
+.git/
+.gitignore
+
+# Ignore local environment files
+.env
+
+# Ignore logs
+*.log
+
+# Ignore IDE files
+.vscode/
+
+# Ignore dev files
+deploy.py
+requirements-dev.txt
+
+# Ignore the Hugo public folder
+public/

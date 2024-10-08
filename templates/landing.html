@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome to FlaskAuthForHugo</title>
+    <style>
+        /* Reset basic styles */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #0d1b2a; /* Dark Blue Background */
+            color: white;
+            padding: 20px;  /* Add padding to avoid text touching edges on small screens */
+        }
+
+        .container {
+            text-align: center;
+            background-color: #1b263b; /* Slightly lighter blue for the container */
+            padding: 50px;
+            border-radius: 12px;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.3);
+            max-width: 600px;  /* Set a maximum width for larger screens */
+            width: 100%;  /* Ensure the container adjusts to smaller screens */
+            margin: 0 auto;
+        }
+
+        h1 {
+            font-size: 3vw;  /* Make heading size responsive */
+            margin-bottom: 20px;
+            color: #e0e1dd;  /* Light gray for text */
+            word-wrap: break-word;  /* Prevent text from overflowing */
+        }
+
+        p {
+            font-size: 1.2rem;
+            margin-bottom: 30px;
+        }
+
+        .login-btn {
+            display: inline-block;
+            padding: 15px 30px;
+            font-size: 1.2rem;
+            color: white;
+            background-color: #0077b6; /* Dark blue button */
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: background-color 0.3s ease;
+        }
+
+        .login-btn:hover {
+            background-color: #005f99; /* Slightly darker on hover */
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2rem;
+            }
+
+            p {
+                font-size: 1rem;
+            }
+
+            .login-btn {
+                font-size: 1rem;
+                padding: 12px 25px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            h1 {
+                font-size: 1.8rem;
+            }
+
+            p {
+                font-size: 0.9rem;
+            }
+
+            .login-btn {
+                font-size: 0.9rem;
+                padding: 10px 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to FlaskAuthForHugo</h1>
+        <p>Please log in to continue</p>
+        <a href="{{ url_for('login') }}" class="login-btn">Log In</a>
+    </div>
+</body>
+</html>
