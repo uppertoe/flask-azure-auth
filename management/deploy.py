@@ -21,7 +21,7 @@ AZURE_APP_NAME = os.getenv('AZURE_APP_NAME')
 RESOURCE_GROUP = os.getenv('RESOURCE_GROUP')
 LOCATION = os.getenv('LOCATION')
 SUBSCRIPTION_ID = os.getenv('AZURE_SUBSCRIPTION_ID')
-TENANT_ID = os.getenv('AZURE_TENANT_ID')
+AZURE_TENANT_ID = os.getenv('AZURE_TENANT_ID')
 REDIRECT_URI = os.getenv('REDIRECT_URI')
 
 GITHUB_REPO = os.getenv('GITHUB_REPO')  # Format: "owner/repo"
@@ -367,7 +367,7 @@ def main():
         client_secret = create_or_replace_client_secret(app_id)
 
         # Set the environment variables for the web app
-        set_app_settings(client_id, client_secret, TENANT_ID)
+        set_app_settings(client_id, client_secret, AZURE_TENANT_ID)
 
         # Restart the web app to apply the new environment variables
         restart_web_app()

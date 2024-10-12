@@ -2,6 +2,8 @@
 azure-mgmt-web
 azure-identity
 azure-mgmt-resource
+azure-mgmt-storage
+azure-mgmt-appcontainers
 azure-graphrbac
 msgraph-core
 pynacl
