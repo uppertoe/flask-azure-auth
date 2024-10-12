@@ -6,13 +6,14 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from jose import jwt
 import msal
+from werkzeug.exceptions import NotFound
 
 # Set default environment (production) and load .env
 FLASK_ENV = os.getenv('FLASK_ENV', 'production')
 
 # Load .env only in development
-if os.getenv('FLASK_ENV') == 'development' and os.path.exists('.env'):
-    load_dotenv()
+if os.getenv('FLASK_ENV') == 'development' and os.path.exists('../.env'):
+    load_dotenv('../.env')
 
 # Initialize the Flask app
 app = Flask(__name__)
@@ -21,14 +22,13 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key')
 
 # Load configurations from environment variables
-app.config['AZURE_CLIENT_ID'] = os.getenv('AZURE_CLIENT_ID')
-app.config['AZURE_CLIENT_SECRET'] = os.getenv('AZURE_CLIENT_SECRET')
-app.config['AZURE_AUTHORITY'] = os.getenv('AZURE_AUTHORITY')
-app.config['AZURE_SCOPE'] = os.getenv('AZURE_SCOPE', '').split()
-app.config['REDIRECT_URI'] = os.getenv('REDIRECT_URI')
-app.config['AZURE_TENANT_ID'] = os.getenv('AZURE_TENANT_ID')
-app.config['ALLOWED_EMAIL_DOMAIN'] = os.getenv('ALLOWED_EMAIL_DOMAIN')
-app.config['ALLOWED_GROUP_IDS'] = os.getenv('ALLOWED_GROUP_IDS', '').split(',')
+AZURE_CLIENT_ID = os.getenv('AZURE_CLIENT_ID')
+AZURE_CLIENT_SECRET = os.getenv('AZURE_CLIENT_SECRET')
+AZURE_SCOPE = os.getenv('AZURE_SCOPE', '').split()
+REDIRECT_URI = os.getenv('REDIRECT_URI')
+AZURE_TENANT_ID = os.getenv('AZURE_TENANT_ID')
+ALLOWED_EMAIL_DOMAIN = os.getenv('ALLOWED_EMAIL_DOMAIN')
+ALLOWED_GROUP_IDS = os.getenv('ALLOWED_GROUP_IDS', '').split(',')
 app.config['DEBUG'] = os.getenv('DEBUG', False)  # Defaults to False if not set
 
 app.config['SESSION_COOKIE_SECURE'] = not app.debug  # Secure for production
@@ -43,6 +43,10 @@ app.config['SESSION_TYPE'] = 'filesystem'  # Use file system for sessions
 app.config['SESSION_FILE_DIR'] = './flask_sessions'  # Directory for session files
 app.config['SESSION_PERMANENT'] = False  # Session expires when the browser is closed
 
+# Set other variables
+AZURE_AUTHORITY = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
+HUGO_PATH = 'public' if app.debug else os.getenv('HUGO_PATH', '/home/site/wwwroot/public')
+
 # Initialize Flask-Session
 Session(app)
 
@@ -51,9 +55,9 @@ csrf = CSRFProtect(app)
 
 # Initialize MSAL Confidential Client
 msal_app = msal.ConfidentialClientApplication(
-    app.config['AZURE_CLIENT_ID'],
-    authority=app.config['AZURE_AUTHORITY'],
-    client_credential=app.config['AZURE_CLIENT_SECRET'],
+    AZURE_CLIENT_ID,
+    authority=AZURE_AUTHORITY,
+    client_credential=AZURE_CLIENT_SECRET,
     token_cache=None  # Configure token cache as needed
 )
 
@@ -83,8 +87,9 @@ def set_security_headers(response):
     response.headers['Content-Security-Policy'] = (
         "default-src 'self'; "
         "style-src 'self' 'unsafe-inline'; "  # Allow inline styles
-        "img-src 'self'; "  # Restrict images to self
-        "font-src 'self'; "  # Restrict fonts to self
+        "script-src 'self' 'unsafe-inline'; "  # Allow inline scripts and event handlers
+        "img-src 'self'; "
+        "font-src 'self'; "
     )
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
@@ -97,7 +102,7 @@ def set_security_headers(response):
 @app.route('/')
 def index():
     if app.debug or is_authenticated():
-        return send_from_directory('public', 'index.html')
+        return send_from_directory(HUGO_PATH, 'index.html')
     # Render the landing page if not authenticated
     return render_template('landing.html')
 
@@ -105,8 +110,8 @@ def index():
 def login():
     session["state"] = os.urandom(24).hex()
     auth_url = msal_app.get_authorization_request_url(
-        scopes=app.config['AZURE_SCOPE'],
-        redirect_uri=app.config['REDIRECT_URI'],
+        scopes=AZURE_SCOPE,
+        redirect_uri=REDIRECT_URI,
         state=session["state"]
     )
     return redirect(auth_url)
@@ -114,22 +119,24 @@ def login():
 @app.route('/logout')
 def logout():
     session.clear()
-    logout_url = f"{app.config['AZURE_AUTHORITY']}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('index', _external=True)}"
+    logout_url = f"{AZURE_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('index', _external=True)}"
     return redirect(logout_url)
 
 @app.route('/login/authorized')
 def authorized():
     if request.args.get('state') != session.get('state'):
         abort(400, description="Invalid state parameter.")
+
     if 'error' in request.args:
         return f"Error: {request.args.get('error_description')}", 400
     code = request.args.get('code')
+
     if not code:
         abort(400, description="Authorization code not found.")
     result = msal_app.acquire_token_by_authorization_code(
         code,
-        scopes=app.config['AZURE_SCOPE'],
-        redirect_uri=app.config['REDIRECT_URI']
+        scopes=AZURE_SCOPE,
+        redirect_uri=REDIRECT_URI
     )
     if "error" in result:
         return f"Error: {result.get('error_description')}", 400
@@ -140,15 +147,15 @@ def authorized():
         return "Authentication failed: ID token or access token not found.", 400
     
     claims = jwt.get_unverified_claims(id_token)
-    if claims.get('tid') != app.config['AZURE_TENANT_ID']:
+    if claims.get('tid') != AZURE_TENANT_ID:
         return "Unauthorized tenant.", 403
     
     user_email = claims.get('email') or claims.get('upn')
-    if not user_email or not user_email.endswith(app.config['ALLOWED_EMAIL_DOMAIN']):
+    if not user_email or not user_email.endswith(ALLOWED_EMAIL_DOMAIN):
         return "Unauthorized user.", 403
     
     user_groups = claims.get('groups', [])
-    allowed_group_ids = [group_id for group_id in app.config['ALLOWED_GROUP_IDS'] if group_id]  # Remove empty strings
+    allowed_group_ids = [group_id for group_id in ALLOWED_GROUP_IDS if group_id]  # Remove empty strings
     if allowed_group_ids and not any(group_id in allowed_group_ids for group_id in user_groups):
         return "User does not belong to an authorized group.", 403
 
@@ -161,19 +168,48 @@ def authorized():
 
     return redirect(url_for('index'))
 
-@app.route('/<path:filename>')
-def serve_static(filename):
+@app.route('/<path:path>')
+def serve_static(path):
+    '''
+    Safely serves the Hugo site from the public/ directory
+
+    Protected from directory traversal attacks by Flask's send_from_directory()
+    '''
+
+    # Ensure logged in
     if not app.debug and not is_authenticated():
         return redirect(url_for('login'))
-    if os.path.isfile(os.path.join('public', filename)):
-        return send_from_directory('public', filename)
-    else:
+
+    full_path = os.path.join(HUGO_PATH, path)
+
+    # If the path is a directory
+    if os.path.isdir(full_path):
+        # Ensure URL ends with a trailing slash
+        if not request.path.endswith('/'):
+            return redirect(request.path + '/')
+        # Serve 'index.html' from the directory
+        return send_from_directory(full_path, 'index.html')
+
+    # Try to serve the file directly (images and other static files)
+    try:
+        return send_from_directory(HUGO_PATH, path)
+    except NotFound:
+        pass  # File not found, proceed to try adding '.html'
+
+    # Try adding '.html' extension
+    html_file = f"{path}.html"
+    try:
+        return send_from_directory(HUGO_PATH, html_file)
+    except NotFound:
         abort(404)
 
 # Custom 404 Error Page
 @app.errorhandler(404)
 def page_not_found(e):
-    return send_from_directory('public', '404.html'), 404
+    try:
+        return send_from_directory(HUGO_PATH, '404.html'), 404
+    except:
+        return "404 Not Found", 404
 
 if __name__ == '__main__':
     app.run(port=5006)
