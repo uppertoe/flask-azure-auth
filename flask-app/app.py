@@ -212,4 +212,4 @@ def page_not_found(e):
         return "404 Not Found", 404
 
 if __name__ == '__main__':
-    app.run(port=5006)
+    app.run(port=8000)

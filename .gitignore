@@ -3,6 +3,7 @@
 # Environment variables
 .env
 .env.bak
+.container-env
 
 # Python cache
 __pycache__/
