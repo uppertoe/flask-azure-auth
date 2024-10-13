@@ -7,10 +7,12 @@ import requests
 import base64
 import subprocess
 import tempfile
-from azure.identity import AzureCliCredential, DefaultAzureCredential
+import dns.resolver
+import tldextract
+from azure.identity import AzureCliCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
-from azure.mgmt.storage.models import StorageAccountCreateParameters, Sku, Kind
+from azure.mgmt.storage.models import StorageAccountCreateParameters, StorageAccountUpdateParameters, Sku, Kind, AzureFilesIdentityBasedAuthentication, Identity
 from dotenv import load_dotenv
 from nacl import public
 
@@ -31,6 +33,7 @@ CUSTOM_DOMAIN = os.getenv('CUSTOM_DOMAIN')
 AZURE_SCOPE = os.getenv('AZURE_SCOPE')
 ALLOWED_EMAIL_DOMAIN = os.getenv('ALLOWED_EMAIL_DOMAIN')
 ALLOWED_GROUP_IDS = os.getenv('ALLOWED_GROUP_IDS')
+MOUNT_PATH = os.getenv('MOUNT_PATH')
 
 # GitHub Variables
 GITHUB_REPO = os.getenv('GITHUB_REPO')  # Format: "owner/repo"
@@ -41,6 +44,8 @@ CONTAINER_ENV_NAME = os.getenv('CONTAINER_ENV_NAME', f'{AZURE_APP_NAME}-env')
 
 # Other variables
 GUNICORN_PORT = 8000
+FLASK_SECRET_KEY = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+SERVE_DIRECTORY = 'public'  # Switch to temp/ for zero-downtime Hugo deployment
 
 # Use Azure CLI for authentication
 credential = AzureCliCredential()
@@ -64,14 +69,17 @@ def create_resource_group_if_not_exists():
         )
         print(f"Resource group {AZURE_RESOURCE_GROUP} created successfully.")
 
-# Function to provision the Azure File Share
+# Function to provision the Azure File Share with Service Principal Access
 def provision_azure_file_share():
     print(f"Checking if storage account {AZURE_STORAGE_ACCOUNT_NAME} exists...")
 
     try:
+        # Check if the storage account exists
         storage_account = storage_client.storage_accounts.get_properties(AZURE_RESOURCE_GROUP, AZURE_STORAGE_ACCOUNT_NAME)
         print(f"Storage account {AZURE_STORAGE_ACCOUNT_NAME} exists.")
+    
     except Exception:
+        # If the storage account doesn't exist, create it
         print(f"Storage account {AZURE_STORAGE_ACCOUNT_NAME} does not exist. Creating it...")
         storage_async_operation = storage_client.storage_accounts.begin_create(
             AZURE_RESOURCE_GROUP,
@@ -79,11 +87,26 @@ def provision_azure_file_share():
             StorageAccountCreateParameters(
                 sku=Sku(name="Standard_LRS"),
                 kind=Kind.STORAGE_V2,
-                location=AZURE_LOCATION
+                location=AZURE_LOCATION,
+                identity=Identity(type="SystemAssigned")  # Enable managed identity during creation
             )
         )
         storage_async_operation.result()  # Wait for the creation to complete
         print(f"Storage account {AZURE_STORAGE_ACCOUNT_NAME} created successfully.")
+
+    # Enable Azure AD identity-based access for the storage account
+    print(f"Enabling identity-based access on storage account {AZURE_STORAGE_ACCOUNT_NAME}...")
+    storage_client.storage_accounts.update(
+        AZURE_RESOURCE_GROUP,
+        AZURE_STORAGE_ACCOUNT_NAME,
+        StorageAccountUpdateParameters(
+            azure_files_identity_based_authentication=AzureFilesIdentityBasedAuthentication(
+                directory_service_options="AADKERB"  # This allows Azure AD-based access
+            ),
+            identity=Identity(type="SystemAssigned")  # Ensure managed identity is enabled
+        )
+    )
+    print(f"Azure AD identity-based access enabled for {AZURE_STORAGE_ACCOUNT_NAME}.")
 
     storage_keys = storage_client.storage_accounts.list_keys(AZURE_RESOURCE_GROUP, AZURE_STORAGE_ACCOUNT_NAME)
     storage_account_key = storage_keys.keys[0].value
@@ -108,10 +131,11 @@ def provision_azure_file_share():
     
     return storage_account_key
 
+
 # Function to mount the Azure File Share in the Azure Container App
 def mount_azure_file_share_in_container(storage_account_key):
     try:
-        print(f"Mounting Azure File Share {AZURE_FILE_SHARE_NAME} to /mnt/public in the container app environment...")
+        print(f"Mounting Azure File Share {AZURE_FILE_SHARE_NAME} to /mnt in the container app environment...")
 
         # Set the storage configuration in the container app environment
         subprocess.run([
@@ -166,7 +190,7 @@ def create_container_environment_if_not_exists():
 
         print(f"Azure Container Environment {CONTAINER_ENV_NAME} created successfully.")
 
-def create_azure_container_app(client_id, client_secret):
+def create_azure_container_app(ad_client_id, sp_client_secret):
     print(f"Creating Azure Container App {AZURE_APP_NAME} using Docker image {DOCKER_IMAGE_TAG}...")
 
     # Handle empty or missing values for certain environment variables
@@ -183,9 +207,9 @@ def create_azure_container_app(client_id, client_secret):
           name: {AZURE_APP_NAME}-container
           env:
             - name: AZURE_CLIENT_ID
-              value: {client_id}
+              value: {ad_client_id}
             - name: AZURE_CLIENT_SECRET
-              value: {client_secret}
+              value: {sp_client_secret}
             - name: AZURE_TENANT_ID
               value: {AZURE_TENANT_ID}
             - name: REDIRECT_URI
@@ -194,6 +218,12 @@ def create_azure_container_app(client_id, client_secret):
               value: {AZURE_SCOPE}
             - name: ALLOWED_EMAIL_DOMAIN
               value: {ALLOWED_EMAIL_DOMAIN}
+            - name: SECRET_KEY
+              value: {FLASK_SECRET_KEY}
+            - name: MOUNT_PATH
+              value: {MOUNT_PATH}
+            - name: SERVE_DIRECTORY
+              value: {SERVE_DIRECTORY}
     '''
 
     # Conditionally include ALLOWED_GROUP_IDS only if it has a value
@@ -210,7 +240,7 @@ def create_azure_container_app(client_id, client_secret):
             memory: 0.5Gi
           volumeMounts:
             - volumeName: azure-files-volume
-              mountPath: /mnt/public
+              mountPath: /mnt
         volumes:
         - name: azure-files-volume
           storageType: AzureFile
@@ -228,7 +258,7 @@ def create_azure_container_app(client_id, client_secret):
             "az", "containerapp", "create",
             "--name", AZURE_APP_NAME,
             "--resource-group", AZURE_RESOURCE_GROUP,
-            "--yaml", temp_yaml_file_path
+            "--yaml", temp_yaml_file_path,
         ], check=True)
 
         print(f"Azure Container App {AZURE_APP_NAME} created successfully.")
@@ -256,19 +286,13 @@ def enable_ingress(container_app_name, resource_group, target_port=8000):
 # Function to determine if the domain is apex or subdomain
 def get_domain_validation_method(domain_name):
     if domain_name.count('.') == 1:
-        # Apex domain (example.com)
-        validation_method = "TXT"
+        return "TXT"
     else:
-        # Subdomain (e.g., dev.example.com)
-        validation_method = "CNAME"
-    
-    return validation_method
+        return "CNAME"
 
-# Function to retrieve the IP or FQDN based on domain type
-def get_dns_info(domain_name, container_app_name, resource_group, container_env_name):
-    if domain_name.count('.') == 1:  # Apex domain
-        # Get the static IP of the container app environment
-        print("Retrieving static IP for apex domain DNS configuration...")
+# Function to retrieve the required DNS info from Azure
+def get_required_dns_info(domain_name, container_app_name, resource_group, container_env_name):
+    if domain_name.count('.') == 1:  # Apex domain (A record)
         result = subprocess.run([
             "az", "containerapp", "env", "show",
             "--name", container_env_name,
@@ -277,9 +301,7 @@ def get_dns_info(domain_name, container_app_name, resource_group, container_env_
             "--output", "tsv"
         ], capture_output=True, text=True, check=True)
         return result.stdout.strip()
-    else:
-        # Get the FQDN of the container app for subdomain
-        print("Retrieving FQDN for subdomain DNS configuration...")
+    else:  # Subdomain (CNAME)
         result = subprocess.run([
             "az", "containerapp", "show",
             "--name", container_app_name,
@@ -291,7 +313,6 @@ def get_dns_info(domain_name, container_app_name, resource_group, container_env_
 
 # Function to get the domain verification code
 def get_domain_verification_code(container_app_name, resource_group):
-    print(f"Retrieving domain verification code for container app {container_app_name}...")
     result = subprocess.run([
         "az", "containerapp", "show",
         "--name", container_app_name,
@@ -299,60 +320,133 @@ def get_domain_verification_code(container_app_name, resource_group):
         "--query", "properties.customDomainVerificationId",
         "--output", "tsv"
     ], capture_output=True, text=True, check=True)
-    
     return result.stdout.strip()
 
-# Function to configure DNS and display user-friendly instructions
+# Helper function to check actual DNS records of the custom domain
+def check_dns_record_exists(record_type, domain, expected_value):
+    try:
+        answers = dns.resolver.resolve(domain, record_type)
+        for answer in answers:
+            if expected_value in str(answer):
+                return True
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        return False
+    return False
+
+# Function to configure DNS by comparing actual DNS with Azure's required DNS records
 def configure_dns(domain_name, container_app_name, resource_group, container_env_name):
+    # Extract the domain components
+    extracted = tldextract.extract(domain_name)
+    subdomain = extracted.subdomain
+    full_domain = f"{extracted.domain}.{extracted.suffix}"
+
     validation_method = get_domain_validation_method(domain_name)
-    dns_value = get_dns_info(domain_name, container_app_name, resource_group, container_env_name)
+    required_dns_value = get_required_dns_info(domain_name, container_app_name, resource_group, container_env_name)
     verification_code = get_domain_verification_code(container_app_name, resource_group)
 
-    print("\nConfigure the following DNS records at your domain registrar:\n")
-    
-    if validation_method == "TXT":  # Apex domain
-        print(f"Record Type: A")
-        print(f"Host: @")
-        print(f"Value: {dns_value}\n")
-        print(f"Record Type: TXT")
-        print(f"Host: asuid")
-        print(f"Value: {verification_code}\n")
-    else:  # Subdomain
-        subdomain = domain_name.split('.')[0]
-        print(f"Record Type: CNAME")
-        print(f"Host: {subdomain}")
-        print(f"Value: {dns_value}\n")
-        print(f"Record Type: TXT")
-        print(f"Host: asuid.{subdomain}")
-        print(f"Value: {verification_code}\n")
+    # Notify if DNS info couldn't be retrieved, but still proceed
+    if required_dns_value is None:
+        print(f"Could not retrieve the required DNS information for {domain_name} from Azure.")
+        required_dns_value = "<DNS_VALUE_MISSING>"
+
+    # If it's an apex domain (A and TXT records)
+    if validation_method == "TXT":
+        a_record_exists = check_dns_record_exists("A", full_domain, required_dns_value)
+        txt_record_exists = check_dns_record_exists("TXT", full_domain, verification_code)
+
+        if a_record_exists and txt_record_exists:
+            print(f"DNS validation already configured for domain {full_domain}. No action needed.")
+        else:
+            print("\nConfigure the following DNS records at your domain registrar:\n")
+            if not a_record_exists:
+                print(f"Record Type: A")
+                print(f"Host: @")
+                print(f"Value: {required_dns_value}\n")
+            if not txt_record_exists:
+                print(f"Record Type: TXT")
+                print(f"Host: @ (or asuid)")
+                print(f"Value: {verification_code}\n")
+            input("\nPress Enter after you've configured the DNS records...")
+
+    # If it's a subdomain (CNAME and TXT records)
+    else:
+        if subdomain:
+            host = f"{subdomain}.{full_domain}"
+        else:
+            host = full_domain
+
+        cname_record_exists = check_dns_record_exists("CNAME", host, required_dns_value)
+        txt_record_exists = check_dns_record_exists("TXT", f"asuid.{subdomain}", verification_code)
+
+        if cname_record_exists and txt_record_exists:
+            print(f"DNS validation already configured for subdomain {host}. No action needed.")
+        else:
+            print("\nConfigure the following DNS records at your domain registrar:\n")
+            if not cname_record_exists:
+                print(f"Record Type: CNAME")
+                print(f"Host: {host}")
+                print(f"Value: {required_dns_value}\n")
+            if not txt_record_exists:
+                print(f"Record Type: TXT")
+                print(f"Host: asuid.{subdomain}")
+                print(f"Value: {verification_code}\n")
+            input("\nPress Enter after you've configured the DNS records...")
 
 # Function to check if custom domain and certificate are already configured
 def is_custom_domain_configured(container_app_name, resource_group, domain_name):
-    print(f"Checking if custom domain {domain_name} is already configured for {container_app_name}...")
-    result = subprocess.run([
-        "az", "containerapp", "hostname", "list",
-        "--name", container_app_name,
-        "--resource-group", resource_group,
-        "--query", "[?name=='{}']".format(domain_name),
-        "--output", "json"
-    ], capture_output=True, text=True, check=True)
-    
-    domains = result.stdout.strip()
-    return bool(domains)  # Return True if domain is found
+    print(f"Checking if custom domain '{domain_name}' is already configured for {container_app_name}...")
+    try:
+        result = subprocess.run(
+            ["az", "containerapp", "hostname", "list",
+             "--name", container_app_name,
+             "--resource-group", resource_group,
+             "--output", "json"],
+            capture_output=True, text=True, check=True
+        )
+        
+        # Parse the list of hostnames to see if the domain is already added
+        hostnames = json.loads(result.stdout)
+        for hostname in hostnames:
+            if hostname['name'] == domain_name:
+                print(f"Custom domain '{domain_name}' is already configured.")
+                return True
+        
+        print(f"Custom domain '{domain_name}' is not configured.")
+        return False
+    except subprocess.CalledProcessError as e:
+        print(f"Error checking for custom domain: {e}")
+        return False
 
-# Function to check if the certificate is bound
 def is_certificate_bound(container_app_name, resource_group, domain_name):
-    print(f"Checking if certificate is bound to {domain_name} for {container_app_name}...")
-    result = subprocess.run([
-        "az", "containerapp", "hostname", "show",
-        "--name", container_app_name,
-        "--resource-group", resource_group,
-        "--hostname", domain_name,
-        "--query", "sslCertThumbprint",
-        "--output", "tsv"
-    ], capture_output=True, text=True)
-    
-    return bool(result.stdout.strip())
+    print(f"Checking if a certificate is bound to domain '{domain_name}' for {container_app_name}...")
+
+    try:
+        # List the hostnames and check the binding info
+        result = subprocess.run(
+            ["az", "containerapp", "hostname", "list",
+             "--name", container_app_name,
+             "--resource-group", resource_group,
+             "--output", "json"],
+            capture_output=True, text=True, check=True
+        )
+
+        hostnames = json.loads(result.stdout)
+
+        # Go through the hostnames to find our domain and check for certificate details
+        for hostname in hostnames:
+            if hostname['name'] == domain_name:
+                if 'sslCertThumbprint' in hostname:
+                    print(f"Certificate is bound to domain '{domain_name}' with thumbprint: {hostname['sslCertThumbprint']}")
+                    return True
+                else:
+                    print(f"No certificate bound to domain '{domain_name}'.")
+                    return False
+
+        print(f"Domain '{domain_name}' not found among the configured hostnames.")
+        return False
+    except subprocess.CalledProcessError as e:
+        print(f"Error checking certificate binding: {e}")
+        return False
 
 # Function to add the custom hostname to the environment
 def add_custom_hostname(container_app_name, resource_group, domain_name, container_env_name):
@@ -403,40 +497,100 @@ def configure_custom_domain(container_app_name, resource_group, domain_name, con
     # Add custom hostname if not already added
     if not is_custom_hostname_added(container_app_name, resource_group, domain_name):
         add_custom_hostname(container_app_name, resource_group, domain_name, container_env_name)
+    else:
+        print(f"Custom domain '{domain_name}' already exists. Skipping domain addition.")
 
-    # Check if custom domain and certificate are already configured
+    # Check if the custom domain is already configured
     if is_custom_domain_configured(container_app_name, resource_group, domain_name):
+        # Check if the certificate is bound
         if is_certificate_bound(container_app_name, resource_group, domain_name):
-            print(f"Custom domain {domain_name} and certificate are already configured. Skipping setup.")
+            print(f"Custom domain '{domain_name}' and certificate are already configured and bound. Skipping setup.")
             return
         else:
-            print(f"Custom domain {domain_name} is configured, but certificate is not bound. Proceeding with certificate setup.")
+            print(f"Custom domain '{domain_name}' is configured, but certificate is not bound. Proceeding with certificate binding.")
+            # Bind existing certificate (no need to recreate)
+            bind_existing_certificate(container_app_name, resource_group, domain_name, container_env_name)
+            return
     else:
         # Add the domain to the container app
-        print(f"Adding custom domain {domain_name} to container app {container_app_name}...")
+        print(f"Adding custom domain '{domain_name}' to container app '{container_app_name}'...")
         subprocess.run([
             "az", "containerapp", "hostname", "add",
             "--hostname", domain_name,
             "--resource-group", resource_group,
             "--name", container_app_name
         ], check=True)
+
+        # Proceed with certificate creation and binding
+        print(f"Proceeding with new certificate setup for domain '{domain_name}'...")
+
+        # Get the validation method based on domain type
+        validation_method = get_domain_validation_method(domain_name)
+
+        # Set up the Azure-managed certificate
+        print(f"Setting up Azure-managed certificate for domain '{domain_name}'...")
+        subprocess.run([
+            "az", "containerapp", "hostname", "bind",
+            "--hostname", domain_name,
+            "--resource-group", resource_group,
+            "--name", container_app_name,
+            "--environment", container_env_name,
+            "--validation-method", validation_method
+        ], check=True)
+
+    print(f"Custom domain '{domain_name}' and certificate successfully configured.")
+
+def get_existing_certificates(container_env_name, resource_group):
+    print(f"Checking for existing managed certificates in environment '{container_env_name}'...")
     
-    # Get the validation method based on domain type
-    validation_method = get_domain_validation_method(domain_name)
+    try:
+        result = subprocess.run([
+            "az", "containerapp", "env", "certificate", "list",
+            "--name", container_env_name,
+            "--resource-group", resource_group,
+            "--output", "json"
+        ], capture_output=True, text=True, check=True)
+        
+        certificates = json.loads(result.stdout)
+        return certificates
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to list managed certificates: {e}")
+        return []
 
-    # Set up the Azure-managed certificate
-    print(f"Setting up Azure-managed certificate for domain {domain_name}...")
-    subprocess.run([
-        "az", "containerapp", "hostname", "bind",
-        "--hostname", domain_name,
-        "--resource-group", resource_group,
-        "--name", container_app_name,
-        "--environment", container_env_name,
-        "--validation-method", validation_method
-    ], check=True)
+def bind_existing_certificate(container_app_name, resource_group, domain_name, container_env_name):
+    print(f"Binding existing certificate to domain '{domain_name}'...")
 
-    print(f"Custom domain {domain_name} and certificate successfully configured.")
+    # Fetch the list of managed certificates in the environment
+    certificates = get_existing_certificates(container_env_name, resource_group)
+    try:
+        # Check if a successful certificate for the domain exists
+        matching_cert = None
+        for cert in certificates:
+            if cert['properties']['subjectName'] == domain_name and cert['properties']['provisioningState'] == 'Succeeded':
+                matching_cert = cert
+                break
+        
+        if matching_cert:
+            cert_name = matching_cert['name']
+            print(f"Found existing certificate '{cert_name}' for domain '{domain_name}'. Binding it now...")
+            
+            # Bind the existing certificate to the domain
+            subprocess.run([
+                "az", "containerapp", "hostname", "bind",
+                "--hostname", domain_name,
+                "--resource-group", resource_group,
+                "--name", container_app_name,
+                "--environment", container_env_name,
+                "--certificate", cert_name
+            ], check=True)
+            
+            print(f"Successfully bound certificate '{cert_name}' to domain '{domain_name}'.")
+        else:
+            print(f"No valid existing certificate found for domain '{domain_name}'. Cannot bind certificate.")
 
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to bind existing certificate: {e}")
+        raise
 
 # Register or retrieve the Azure AD application via Microsoft Graph API
 def register_or_get_azure_ad_app():
@@ -506,40 +660,34 @@ def register_or_get_azure_ad_app():
 
     return app_id, client_id
 
-# Create or replace the Azure AD client secret
-def create_or_replace_client_secret(app_id):
-    print(f"Replacing client secrets for Azure AD App ID: {app_id}...")
+def create_service_principal():
+    print(f"Creating Service Principal for {AZURE_APP_NAME}...")
 
-    token = credential.get_token("https://graph.microsoft.com/.default")
+    # Create the service principal with Contributor role on the resource group
+    result = subprocess.run([
+        "az", "ad", "sp", "create-for-rbac",
+        "--name", AZURE_APP_NAME,
+        "--role", "Contributor",  # General management permissions
+        "--scopes", f"/subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}",
+        "--json-auth"
+    ], capture_output=True, text=True, check=True)
 
-    headers = {'Authorization': f"Bearer {token.token}", 'Content-Type': 'application/json'}
+    json_creds = result.stdout
+    sp_info = json.loads(json_creds)
+    client_id = sp_info["clientId"]
+    client_secret = sp_info["clientSecret"]
+    print(f"Service Principal created with client_id: {client_id}")
 
-    password_credentials_url = f"https://graph.microsoft.com/v1.0/applications/{app_id}/passwordCredentials"
-    password_response = requests.get(password_credentials_url, headers=headers)
+    # Assign "SStorage File Data Privileged Contributor" role to the service principal for REST API access
+    print(f"Assigning Storage File Data Privileged Contributor role to {AZURE_APP_NAME} for file share REST API access...")
+    subprocess.run([
+        "az", "role", "assignment", "create",
+        "--assignee", client_id,
+        "--role", "Storage File Data Privileged Contributor",  # Role for REST API access
+        "--scope", f"/subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/{AZURE_STORAGE_ACCOUNT_NAME}"
+    ], check=True)
 
-    if password_response.status_code != 200:
-        raise Exception(f"Failed to retrieve password credentials: {password_response.text}")
-
-    password_credentials = password_response.json().get('value', [])
-
-    for password_credential in password_credentials:
-        key_id = password_credential['keyId']
-        delete_url = f"https://graph.microsoft.com/v1.0/applications/{app_id}/removePassword"
-        delete_data = {"keyId": key_id}
-        requests.post(delete_url, headers=headers, json=delete_data)
-
-    secret_data = {"passwordCredential": {"displayName": f"ClientSecret-{random.choice(string.ascii_lowercase)}"}}
-    create_secret_url = f"https://graph.microsoft.com/v1.0/applications/{app_id}/addPassword"
-
-    response = requests.post(create_secret_url, headers=headers, json=secret_data)
-
-    if response.status_code != 200:
-        raise Exception(f"Failed to create a client secret: {response.text}")
-
-    client_secret = response.json()["secretText"]
-    print("New client secret created successfully.")
-
-    return client_secret
+    return client_id, client_secret, json_creds
 
 # Function to update GitHub secrets
 def update_github_secret(secret_name, secret_value):
@@ -579,18 +727,16 @@ def update_github_secret(secret_name, secret_value):
     print(f"Successfully updated GitHub secret: {secret_name}")
 
 def orchestrate_custom_domain():
-    if not CUSTOM_DOMAIN:
-        print("No custom domain provided. Skipping domain configuration.")
-        return
-    
+
     # Enable ingress for the container app
     enable_ingress(AZURE_APP_NAME, AZURE_RESOURCE_GROUP, GUNICORN_PORT)
 
+    if not CUSTOM_DOMAIN:
+        print("No custom domain provided. Skipping domain configuration.")
+        return
+
     # Configure DNS first with instructions for the user
     configure_dns(CUSTOM_DOMAIN, AZURE_APP_NAME, AZURE_RESOURCE_GROUP, CONTAINER_ENV_NAME)
-
-    # Wait for the user to add the DNS records
-    input("\nPress Enter after you've configured the DNS records...")
 
     # Proceed with domain and certificate setup
     configure_custom_domain(AZURE_APP_NAME, AZURE_RESOURCE_GROUP, CUSTOM_DOMAIN, CONTAINER_ENV_NAME)
@@ -607,15 +753,17 @@ def main():
         register_resource_provider()
         create_container_environment_if_not_exists()
 
-        app_id, client_id = register_or_get_azure_ad_app()
+        app_id, ad_client_id = register_or_get_azure_ad_app()
 
-        client_secret = create_or_replace_client_secret(app_id)
+        sp_client_id, sp_client_secret, json_creds = create_service_principal()
 
         # Create the Azure Container App, passing the client ID and secret
-        create_azure_container_app(client_id, client_secret)
-
+        create_azure_container_app(ad_client_id, sp_client_secret)
+        
+        update_github_secret("AZURE_CREDENTIALS", json_creds)
+        update_github_secret("AZURE_CONTAINER_APP_NAME", AZURE_APP_NAME)
+        update_github_secret("AZURE_RESOURCE_GROUP", AZURE_RESOURCE_GROUP)
         update_github_secret("AZURE_STORAGE_ACCOUNT_NAME", AZURE_STORAGE_ACCOUNT_NAME)
-        update_github_secret("AZURE_STORAGE_ACCOUNT_KEY", storage_account_key)
         update_github_secret("AZURE_FILE_SHARE_NAME", AZURE_FILE_SHARE_NAME)
 
         orchestrate_custom_domain()

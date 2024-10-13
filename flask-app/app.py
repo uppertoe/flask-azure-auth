@@ -2,11 +2,16 @@ from flask import Flask, redirect, url_for, session, request, abort, send_from_d
 from flask_session import Session
 from flask_wtf import CSRFProtect
 import os
+import sys
+import logging
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from jose import jwt
 import msal
 from werkzeug.exceptions import NotFound
+
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+
 
 # Set default environment (production) and load .env
 FLASK_ENV = os.getenv('FLASK_ENV', 'production')
@@ -17,6 +22,8 @@ if os.getenv('FLASK_ENV') == 'development' and os.path.exists('../.env'):
 
 # Initialize the Flask app
 app = Flask(__name__)
+
+app.logger.setLevel(logging.INFO)
 
 # Set secret key from environment variable or a default value
 app.secret_key = os.getenv('SECRET_KEY', 'default_secret_key')
@@ -45,7 +52,13 @@ app.config['SESSION_PERMANENT'] = False  # Session expires when the browser is c
 
 # Set other variables
 AZURE_AUTHORITY = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
-HUGO_PATH = 'public' if app.debug else os.getenv('HUGO_PATH', '/home/site/wwwroot/public')
+MOUNT_PATH = '' if app.debug else os.getenv('MOUNT_PATH', '/mnt')
+SERVE_DIRECTORY = os.getenv('SERVE_DIRECTORY', 'public')  # Switch to temp/ for zero-downtime deploy
+if SERVE_DIRECTORY not in ['public', 'temp']:
+    raise RuntimeError(f'Invalid SERVE_DIRECTORY: {SERVE_DIRECTORY} - exiting.')
+HUGO_PATH = os.path.join(MOUNT_PATH, SERVE_DIRECTORY)
+
+app.logger.info(f"Hugo path: {HUGO_PATH}")
 
 # Initialize Flask-Session
 Session(app)

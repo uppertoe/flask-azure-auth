@@ -7,3 +7,5 @@ azure-mgmt-appcontainers
 azure-graphrbac
 msgraph-core
 pynacl
+dnspython
+tldextract

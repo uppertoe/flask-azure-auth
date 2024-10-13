@@ -25,23 +25,9 @@ cd ..
 docker login -u $DOCKER_HUB_USERNAME
 
 # Build the Docker image with the correct architecture (linux/amd64) from the flask-app folder
-docker build --platform linux/amd64 -t $DOCKER_IMAGE_TAG .
+docker build --no-cache --platform linux/amd64 -t $DOCKER_IMAGE_TAG .
 
 # Push the Docker image to Docker Hub
 docker push $DOCKER_IMAGE_TAG
-
-# Go back to the previous directory
-cd management
-
-# Update the .env file with the new DOCKER_IMAGE_TAG
-if [[ -f .env ]]; then
-  # Create a temporary file without the DOCKER_IMAGE_TAG line
-  awk '!/^DOCKER_IMAGE_TAG=/' .env > .env.tmp && mv .env.tmp .env
-  # Append the new DOCKER_IMAGE_TAG
-  echo "DOCKER_IMAGE_TAG=${DOCKER_IMAGE_TAG}" >> .env
-else
-  echo ".env file not found!"
-  exit 1
-fi
 
 echo "Docker image built and pushed successfully: ${DOCKER_IMAGE_TAG}"
