@@ -87,3 +87,17 @@ venv/
 
 # VS Code
 .vscode/
+
+# Flask
+flask-app/flask_sessions/
+flask-app/public/
+flask-app/.venv
+flask-app/.env
+
+# Ignore Python cache files in flask-app directory
+flask-app/__pycache__/
+flask-app/**/*.pyc
+flask-app/**/*.pyo
+flask-app/**/*.pyd
+
+flask-app/*.pem

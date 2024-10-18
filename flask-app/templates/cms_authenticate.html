@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Authenticating</title>
+        <style>
+            body {
+                margin: 0;
+                padding: 0;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh; /* 100% of the viewport height */
+                background-color: #333; /* Dark grey background */
+                color: #ccc; /* Light grey text */
+                font-family: 'Helvetica', 'Arial', sans-serif; /* Large sans-serif font */
+                font-size: 2rem; /* Larger font size */
+            }
+        </style>
+    </head>
+<body>
+    <div>Authenticating...</div>
+
+    <script>
+    (function() {
+        function receiveMessage(e) {
+            console.log("receiveMessage %o", e);
+            // send message to main window
+            window.opener.postMessage(
+                {{ data|safe }},
+                e.origin
+            );
+        }
+        window.addEventListener("message", receiveMessage, false);
+
+        // Send CSRF if authenticated; ignored by DecapCMS
+        window.opener.postMessage(`{{ token|safe }}`, window.location.origin)
+
+        // Start handshake with parent
+        console.log("Sending message: %o", "github");
+        window.opener.postMessage("authorizing:github", "*");
+    })();
+    </script>
+</body>
+</html>

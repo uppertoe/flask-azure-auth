@@ -5,6 +5,9 @@
 .env.bak
 .container-env
 
+# Secrets
+*.pem
+
 # Python cache
 __pycache__/
 *.pyc
@@ -15,10 +18,13 @@ hugo_site.zip
 
 # Generated files by hugo
 /public/
-/flask_app/public/
+/flask-app/public/
 /resources/_gen/
 /assets/jsconfig.json
 hugo_stats.json
+
+# Flask
+flask_sessions/
 
 # Executable may be added to repository
 hugo.exe
