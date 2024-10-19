@@ -335,60 +335,69 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
     # Start building the YAML configuration
     yaml_config = f"""
     properties:
-    managedEnvironmentId: /subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}/providers/Microsoft.App/managedEnvironments/{CONTAINER_ENV_NAME}
-    configuration: {{}}
-    template:
-        scale:
-          minReplicas: 1
-          maxReplicas: 1
-          rules:
-          - name: httpscalingrule
-            custom:
-              type: http
-              metadata:
-                concurrentRequests: '50'
-        volumes:
-        - name: azure-files-volume
-          storageType: AzureFile
-          storageName: {AZURE_FILE_SHARE_NAME}
-        restartPolicy: Always
-        containers:
-        - image: {DOCKER_IMAGE_TAG}
-          name: {AZURE_APP_NAME}-container
-          resources:
-            cpu: 0.25
-            memory: 0.5Gi
-          probes:
-          - type: Liveness
-            httpGet:
-              path: "/liveness"
-              port: 8000
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          volumeMounts:
-          - mountPath: "/mnt"
-            volumeName: azure-files-volume
-          env:
-          - name: AZURE_CLIENT_ID
-            value: {ad_client_id}
-          - name: AZURE_CLIENT_SECRET
-            value: {sp_client_secret}
-          - name: AZURE_TENANT_ID
-            value: {AZURE_TENANT_ID}
-          - name: REDIRECT_URI
-            value: {REDIRECT_URI}
-          - name: AZURE_SCOPE
-            value: {AZURE_SCOPE}
-          - name: ALLOWED_EMAIL_DOMAIN
-            value: {ALLOWED_EMAIL_DOMAIN}
-          - name: SECRET_KEY
-            value: {FLASK_SECRET_KEY}
-          - name: MOUNT_PATH
-            value: {MOUNT_PATH}
-          - name: CMS_ALLOWED_EMAILS
-            value: {CMS_ALLOWED_EMAILS}
-          - name: CMS_GITHUB_TOKEN
-            value: {CMS_GITHUB_TOKEN}
+      managedEnvironmentId: /subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}/providers/Microsoft.App/managedEnvironments/{CONTAINER_ENV_NAME}
+      configuration:
+        activeRevisionsMode: Single
+        ingress:
+          allowInsecure: false
+          external: true
+          targetPort: 8000
+          traffic:
+          - latestRevision: true
+            weight: 100
+          transport: auto
+      template:
+          scale:
+            minReplicas: 1
+            maxReplicas: 1
+            rules:
+            - name: httpscalingrule
+              custom:
+                type: http
+                metadata:
+                  concurrentRequests: '50'
+          volumes:
+          - name: azure-files-volume
+            storageType: AzureFile
+            storageName: {AZURE_FILE_SHARE_NAME}
+          restartPolicy: Always
+          containers:
+          - image: {DOCKER_IMAGE_TAG}
+            name: {AZURE_APP_NAME}-container
+            resources:
+              cpu: 0.25
+              memory: 0.5Gi
+            probes:
+            - type: Liveness
+              httpGet:
+                path: "/liveness"
+                port: 8000
+              initialDelaySeconds: 5
+              periodSeconds: 10
+            volumeMounts:
+            - mountPath: "/mnt"
+              volumeName: azure-files-volume
+            env:
+            - name: AZURE_CLIENT_ID
+              value: {ad_client_id}
+            - name: AZURE_CLIENT_SECRET
+              value: {sp_client_secret}
+            - name: AZURE_TENANT_ID
+              value: {AZURE_TENANT_ID}
+            - name: REDIRECT_URI
+              value: {REDIRECT_URI}
+            - name: AZURE_SCOPE
+              value: {AZURE_SCOPE}
+            - name: ALLOWED_EMAIL_DOMAIN
+              value: {ALLOWED_EMAIL_DOMAIN}
+            - name: SECRET_KEY
+              value: {FLASK_SECRET_KEY}
+            - name: MOUNT_PATH
+              value: {MOUNT_PATH}
+            - name: CMS_ALLOWED_EMAILS
+              value: {CMS_ALLOWED_EMAILS}
+            - name: CMS_GITHUB_TOKEN
+              value: {CMS_GITHUB_TOKEN}
     """
 
     # Conditionally include ALLOWED_GROUP_IDS only if it has a value
@@ -407,7 +416,7 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
             temp_yaml_file_path = temp_yaml_file.name
 
         # Use the temporary file as input for the `az containerapp create` command
-        run_azure_cli(
+        result = run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -419,6 +428,8 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
                 "--yaml",
                 temp_yaml_file_path,
             ],
+            capture_output=True,
+            text=True,
             check=True,
         )
 
@@ -430,33 +441,6 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
         # Clean up the temporary file
         if os.path.exists(temp_yaml_file_path):
             os.remove(temp_yaml_file_path)
-
-
-# Function to enable ingress
-def enable_ingress(container_app_name, resource_group, target_port=8000):
-    print(
-        f"Enabling ingress for container app {container_app_name} on port {target_port}..."
-    )
-    run_azure_cli(
-        [
-            "az",
-            "containerapp",
-            "ingress",
-            "enable",
-            "--name",
-            container_app_name,
-            "--resource-group",
-            resource_group,
-            "--type",
-            "external",
-            "--target-port",
-            str(target_port),
-            "--transport",
-            "auto",
-        ],
-        check=True,
-    )
-    print(f"Ingress enabled on port {target_port}.")
 
 
 # Function to determine if the domain is apex or subdomain
@@ -539,10 +523,21 @@ def get_domain_verification_code(container_app_name, resource_group):
 
 # Helper function to check actual DNS records of the custom domain
 def check_dns_record_exists(record_type, domain, expected_value):
+    extracted = tldextract.extract(domain)
     try:
-        answers = dns.resolver.resolve(domain, record_type)
+        if record_type == "TXT":
+            url = f"asuid.{extracted.subdomain}.{extracted.domain}.{extracted.suffix}"
+        elif record_type == "A":
+            url = f"{extracted.domain}.{extracted.suffix}"
+        elif record_type == "CNAME":
+            url = f"{extracted.subdomain}.{extracted.domain}.{extracted.suffix}"
+        else:
+            return False
+
+        answers = dns.resolver.resolve(url, record_type)
+
         for answer in answers:
-            if expected_value in str(answer):
+            if expected_value in str(answer).strip('"'):
                 return True
     except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
         return False
@@ -571,9 +566,9 @@ def configure_dns(domain_name, container_app_name, resource_group, container_env
 
     # If it's an apex domain (A and TXT records)
     if validation_method == "TXT":
-        a_record_exists = check_dns_record_exists("A", full_domain, required_dns_value)
+        a_record_exists = check_dns_record_exists("A", domain_name, required_dns_value)
         txt_record_exists = check_dns_record_exists(
-            "TXT", full_domain, verification_code
+            "TXT", domain_name, verification_code
         )
 
         if a_record_exists and txt_record_exists:
@@ -599,9 +594,11 @@ def configure_dns(domain_name, container_app_name, resource_group, container_env
         else:
             host = full_domain
 
-        cname_record_exists = check_dns_record_exists("CNAME", host, required_dns_value)
+        cname_record_exists = check_dns_record_exists(
+            "CNAME", domain_name, required_dns_value
+        )
         txt_record_exists = check_dns_record_exists(
-            "TXT", f"asuid.{subdomain}", verification_code
+            "TXT", domain_name, verification_code
         )
 
         if cname_record_exists and txt_record_exists:
@@ -1034,7 +1031,7 @@ def create_service_principal():
             "--name",
             AZURE_APP_NAME,
             "--role",
-            "Contributor",  # General management permissions
+            "Container Apps Contributor",  # Container management permissions
             "--scopes",
             f"/subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}",
             "--json-auth",
@@ -1121,9 +1118,6 @@ def update_github_secret(secret_name, secret_value):
 
 def orchestrate_custom_domain():
 
-    # Enable ingress for the container app
-    enable_ingress(AZURE_APP_NAME, AZURE_RESOURCE_GROUP, GUNICORN_PORT)
-
     if not CUSTOM_DOMAIN:
         print("No custom domain provided. Skipping domain configuration.")
         return
@@ -1156,7 +1150,7 @@ def main():
         sp_client_id, sp_client_secret, json_creds = create_service_principal()
 
         # Create the Azure Container App, passing the client ID and secret
-        create_azure_container_app(ad_client_id, sp_client_secret)
+        container_app = create_azure_container_app(ad_client_id, sp_client_secret)
 
         update_github_secret("AZURE_CREDENTIALS", json_creds)
         update_github_secret("AZURE_CONTAINER_APP_NAME", AZURE_APP_NAME)
