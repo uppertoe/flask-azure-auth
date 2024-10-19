@@ -28,14 +28,17 @@
             console.log("receiveMessage %o", e);
             // send message to main window
             window.opener.postMessage(
-                {{ data|safe }},
+                {{ data|tojson }},
                 e.origin
             );
         }
         window.addEventListener("message", receiveMessage, false);
 
         // Send CSRF if authenticated; ignored by DecapCMS
-        window.opener.postMessage(`{{ token|safe }}`, window.location.origin)
+        window.opener.postMessage(JSON.stringify({{ token|safe }}), "*")
+        const data = JSON.stringify({{ token|tojson }})
+        console.log(data)
+        console.log(JSON.parse(data))
 
         // Start handshake with parent
         console.log("Sending message: %o", "github");

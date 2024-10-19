@@ -25,7 +25,7 @@ cd ..
 docker login -u $DOCKER_HUB_USERNAME
 
 # Build the Docker image with the correct architecture (linux/amd64) from the flask-app folder
-docker build --no-cache --platform linux/amd64 -t $DOCKER_IMAGE_TAG .
+docker build --platform linux/amd64 -t $DOCKER_IMAGE_TAG .
 
 # Push the Docker image to Docker Hub
 docker push $DOCKER_IMAGE_TAG

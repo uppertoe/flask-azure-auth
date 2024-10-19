@@ -3,12 +3,15 @@ import subprocess
 import json
 import random
 import string
+import time
 import requests
 import base64
 import subprocess
 import tempfile
 import dns.resolver
 import tldextract
+import datetime
+from functools import wraps
 from azure.identity import AzureCliCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
@@ -64,6 +67,65 @@ credential = AzureCliCredential()
 # Initialize resource management and storage clients
 resource_client = ResourceManagementClient(credential, AZURE_SUBSCRIPTION_ID)
 storage_client = StorageManagementClient(credential, AZURE_SUBSCRIPTION_ID)
+
+"""Log Azure CLI commands"""
+# Create or open a log file for appending
+log_filename = (
+    f"logs/deploy_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+)
+command_summary = []
+
+
+# Function to log command output, appending to the same file
+def log_command_output(command_str, result=None, error=None):
+    timestamp = datetime.datetime.now()
+    command_summary.append(f"{timestamp}: {command_str}")
+
+    # Append detailed logs for the command
+    with open(log_filename, "a") as log_file:
+        log_file.write("\n" + "=" * 80 + "\n")
+        log_file.write(f"Timestamp: {timestamp}\n")
+        log_file.write(f"Command: {command_str}\n")
+        if result:
+            log_file.write(f"Result:\n{result}\n")
+        if error:
+            log_file.write(f"Error:\n{error}\n")
+        log_file.write("=" * 80 + "\n")
+
+
+# Wrapper function for subprocess.run with **kwargs to accept other optional arguments
+def run_azure_cli(command, **kwargs):
+    command_str = " ".join(command)
+    try:
+        result = subprocess.run(command, **kwargs)
+        log_command_output(command_str, result=result.stdout)
+        if kwargs.get("check", False) and result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, command)
+        return result
+    except subprocess.CalledProcessError as e:
+        log_command_output(command_str, error=e.stderr)
+        raise
+    except Exception as e:
+        log_command_output(command_str, error=str(e))
+        raise
+
+
+# Function to write the summary of all commands at the top of the log file
+def write_command_summary():
+    # Append a summary of commands at the top of the log file
+    with open(log_filename, "r+") as log_file:
+        existing_content = log_file.read()  # Read existing log content
+        log_file.seek(0)  # Move to the beginning of the file
+        log_file.write("Summary of commands run:\n")
+        for command in command_summary:
+            log_file.write(f"{command}\n")
+        log_file.write("\nDetailed logs:\n")
+        log_file.write(
+            existing_content
+        )  # Write the existing detailed logs after the summary
+
+
+"""Commands"""
 
 
 # Function to create the resource group if it doesn't exist
@@ -166,7 +228,7 @@ def mount_azure_file_share_in_container(storage_account_key):
         )
 
         # Set the storage configuration in the container app environment
-        subprocess.run(
+        run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -205,7 +267,7 @@ def register_resource_provider():
         "Registering Microsoft.OperationalInsights provider if not already registered..."
     )
 
-    subprocess.run(
+    run_azure_cli(
         ["az", "provider", "register", "-n", "Microsoft.OperationalInsights", "--wait"],
         check=True,
     )
@@ -218,7 +280,7 @@ def create_container_environment_if_not_exists():
 
     try:
         # Check if the environment exists
-        result = subprocess.run(
+        result = run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -243,7 +305,7 @@ def create_container_environment_if_not_exists():
         )
 
         # Create the environment if it doesn't exist
-        subprocess.run(
+        run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -277,7 +339,7 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
     configuration: {{}}
     template:
         scale:
-          minReplicas: 0
+          minReplicas: 1
           maxReplicas: 1
           rules:
           - name: httpscalingrule
@@ -289,6 +351,7 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
         - name: azure-files-volume
           storageType: AzureFile
           storageName: {AZURE_FILE_SHARE_NAME}
+        restartPolicy: Always
         containers:
         - image: {DOCKER_IMAGE_TAG}
           name: {AZURE_APP_NAME}-container
@@ -300,8 +363,8 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
             httpGet:
               path: "/liveness"
               port: 8000
-            initialDelaySeconds: 3
-            periodSeconds: 3
+            initialDelaySeconds: 5
+            periodSeconds: 10
           volumeMounts:
           - mountPath: "/mnt"
             volumeName: azure-files-volume
@@ -344,7 +407,7 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
             temp_yaml_file_path = temp_yaml_file.name
 
         # Use the temporary file as input for the `az containerapp create` command
-        subprocess.run(
+        run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -374,7 +437,7 @@ def enable_ingress(container_app_name, resource_group, target_port=8000):
     print(
         f"Enabling ingress for container app {container_app_name} on port {target_port}..."
     )
-    subprocess.run(
+    run_azure_cli(
         [
             "az",
             "containerapp",
@@ -409,7 +472,7 @@ def get_required_dns_info(
     domain_name, container_app_name, resource_group, container_env_name
 ):
     if domain_name.count(".") == 1:  # Apex domain (A record)
-        result = subprocess.run(
+        result = run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -430,7 +493,7 @@ def get_required_dns_info(
         )
         return result.stdout.strip()
     else:  # Subdomain (CNAME)
-        result = subprocess.run(
+        result = run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -453,7 +516,7 @@ def get_required_dns_info(
 
 # Function to get the domain verification code
 def get_domain_verification_code(container_app_name, resource_group):
-    result = subprocess.run(
+    result = run_azure_cli(
         [
             "az",
             "containerapp",
@@ -564,7 +627,7 @@ def is_custom_domain_configured(container_app_name, resource_group, domain_name)
         f"Checking if custom domain '{domain_name}' is already configured for {container_app_name}..."
     )
     try:
-        result = subprocess.run(
+        result = run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -603,7 +666,7 @@ def is_certificate_bound(container_app_name, resource_group, domain_name):
 
     try:
         # List the hostnames and check the binding info
-        result = subprocess.run(
+        result = run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -651,7 +714,7 @@ def add_custom_hostname(
     )
 
     try:
-        subprocess.run(
+        run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -679,7 +742,7 @@ def is_custom_hostname_added(container_app_name, resource_group, domain_name):
     )
 
     try:
-        result = subprocess.run(
+        result = run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -750,7 +813,7 @@ def configure_custom_domain(
         print(
             f"Adding custom domain '{domain_name}' to container app '{container_app_name}'..."
         )
-        subprocess.run(
+        run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -774,7 +837,7 @@ def configure_custom_domain(
 
         # Set up the Azure-managed certificate
         print(f"Setting up Azure-managed certificate for domain '{domain_name}'...")
-        subprocess.run(
+        run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -803,7 +866,7 @@ def get_existing_certificates(container_env_name, resource_group):
     )
 
     try:
-        result = subprocess.run(
+        result = run_azure_cli(
             [
                 "az",
                 "containerapp",
@@ -854,7 +917,7 @@ def bind_existing_certificate(
             )
 
             # Bind the existing certificate to the domain
-            subprocess.run(
+            run_azure_cli(
                 [
                     "az",
                     "containerapp",
@@ -962,7 +1025,7 @@ def create_service_principal():
     print(f"Creating Service Principal for {AZURE_APP_NAME}...")
 
     # Create the service principal with Contributor role on the resource group
-    result = subprocess.run(
+    result = run_azure_cli(
         [
             "az",
             "ad",
@@ -991,7 +1054,7 @@ def create_service_principal():
     print(
         f"Assigning Storage File Data Privileged Contributor role to {AZURE_APP_NAME} for file share REST API access..."
     )
-    subprocess.run(
+    run_azure_cli(
         [
             "az",
             "role",
@@ -1052,6 +1115,7 @@ def update_github_secret(secret_name, secret_value):
         raise Exception(
             f"Failed to update GitHub secret {secret_name}: {response.text}"
         )
+    time.sleep(1)
     print(f"Successfully updated GitHub secret: {secret_name}")
 
 
@@ -1101,6 +1165,8 @@ def main():
         update_github_secret("AZURE_FILE_SHARE_NAME", AZURE_FILE_SHARE_NAME)
 
         orchestrate_custom_domain()
+
+        write_command_summary()
 
         print(f"Deployment completed successfully for {AZURE_APP_NAME}!")
     except Exception as e:

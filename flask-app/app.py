@@ -57,11 +57,6 @@ if not app.debug:
         hours=1
     )  # Set session expiration
 
-# Configure Flask-Session to use the file system
-app.config["SESSION_TYPE"] = "filesystem"  # Use file system for sessions
-app.config["SESSION_FILE_DIR"] = "./flask_sessions"  # Directory for session files
-app.config["SESSION_PERMANENT"] = False  # Session expires when the browser is closed
-
 # Load configurations from environment variables
 AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
 AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
@@ -82,6 +77,30 @@ SERVE_DIRECTORY = os.getenv(
 if SERVE_DIRECTORY not in ["public", "temp"]:
     raise RuntimeError(f"Invalid SERVE_DIRECTORY: {SERVE_DIRECTORY} - exiting.")
 HUGO_PATH = os.path.join(MOUNT_PATH, SERVE_DIRECTORY)
+SESSION_PATH = os.path.join(MOUNT_PATH, "flask_sessions")
+
+# Configure Flask-Session to use the file system
+app.config["SESSION_TYPE"] = "filesystem"  # Use file system for sessions
+app.config["SESSION_FILE_DIR"] = SESSION_PATH  # Directory for session files
+app.config["SESSION_PERMANENT"] = True  # Permanent session
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)  # Session lasts 7 days
+
+# Ensure the public/ and temp/ directories exist
+PUBLIC_DIR = os.path.join(MOUNT_PATH, "public")
+TEMP_DIR = os.path.join(MOUNT_PATH, "temp")
+
+
+def create_directories():
+    try:
+        # Create /public and /temp directories if they don't exist
+        os.makedirs(PUBLIC_DIR, exist_ok=True)
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        print(f"Directories '/public' and '/temp' created or already exist.")
+    except Exception as e:
+        print(f"Error creating directories: {e}")
+
+
+create_directories()  # Call on app start
 
 # Initialize Flask-Session
 Session(app)
@@ -158,7 +177,10 @@ def get_public_key(jwks, kid):
 @app.before_request
 def check_https():
     if not app.debug:
-        if request.headers.get("X-Forwarded-Proto", "http") != "https":
+        # Allow HTTP for internal health check requests
+        if request.path == "/liveness":
+            return None  # Bypass HTTPS enforcement for the probe
+        elif request.headers.get("X-Forwarded-Proto", "http") != "https":
             return redirect(request.url.replace("http://", "https://"))
 
 
@@ -167,7 +189,7 @@ def set_security_headers(response):
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "connect-src 'self' https://api.github.com https://www.githubstatus.com;"  # Allow CMS github access
-        "style-src 'self' 'unsafe-inline'; "  # Allow inline styles
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net/gh/hithismani/responsive-decap@main/dist/responsive.min.css; "  # Allow inline styles
         "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com; "  # Allow inline scripts and event handlers
         "img-src 'self' blob: https://avatars.githubusercontent.com; "
         "font-src 'self'; "
@@ -201,12 +223,10 @@ def add_cache_headers(response):
 """Routes"""
 
 
-@app.route("/")
-def index():
-    if app.debug or is_authenticated():
-        return send_from_directory(HUGO_PATH, "index.html")
-    # Render the landing page if not authenticated
-    return render_template("landing.html")
+# Azure container apps health check
+@app.route("/liveness")
+def health_check():
+    return "OK", 200
 
 
 @app.route("/login")
@@ -341,8 +361,15 @@ def serve_public_static_files():
 # Serve DecapCMS routes without auth
 @app.route("/cms")
 def decap_admin():
+    # Ensure logged in
+    if not app.debug and not is_authenticated():
+        return redirect(url_for("login", next=request.url))
+
     if not app.debug and not cms_is_authenticated():
-        return abort(403)  # Block unauthenticated users
+        # If not on CMS authorised users list
+        return abort(
+            403, "Please contact an administrator if you require CMS access"
+        )  # Block unauthenticated users
 
     # Get the admin template for rendering
     admin_template_path = os.path.join(HUGO_PATH, "admin/index.html")
@@ -357,6 +384,13 @@ def decap_admin():
 def decap_config():
     response = send_from_directory(HUGO_PATH, "admin/config.yml")
     response.headers["Content-Type"] = "text/yaml"  # Set correct content type for YAML
+    return response
+
+
+@app.route("/cms/preview.css")
+def decap_css():
+    response = send_from_directory(HUGO_PATH, "admin/preview.css")
+    response.headers["Content-Type"] = "text/css"  # Set correct content type for CSS
     return response
 
 
@@ -375,13 +409,13 @@ def get_auth_message(succeed=False):
 @app.route("/cms/auth", methods=["GET", "POST"])
 def cms_auth():
     # Determine whether authentication succeeds
-    succeed = app.debug or cms_is_authenticated
+    succeed = app.debug or cms_is_authenticated()
 
     # Structure message for Decap CMS
     message, content = get_auth_message(succeed=succeed)
-    data = json.dumps(f"authorization:github:{message}:{content}")
-    token = generate_csrf() if succeed else ""
-    token_json = json.dumps({"csrf": token})
+    data = f"authorization:github:{message}:{content}"
+    token = generate_csrf() if succeed else None
+    token_json = {"csrf": token}
     return render_template("cms_authenticate.html", data=data, token=token_json)
 
 
@@ -393,6 +427,8 @@ def proxy_request():
     token = request.headers.get(
         "X-CSRF-Token"
     )  # Assuming the CSRF token is sent in the header
+    print(f"Received Token: {token}")
+    print(f"Session Token: {session.get('csrf_token')}")
     if not token:
         abort(400, description="Missing CSRF token")
     try:
@@ -523,6 +559,14 @@ def serve_static(path):
         abort(404)
 
 
+@app.route("/")
+def index():
+    if app.debug or is_authenticated():
+        return send_from_directory(HUGO_PATH, "index.html")
+    # Render the landing page if not authenticated
+    return render_template("landing.html")
+
+
 # Custom 404 Error Page
 @app.errorhandler(404)
 def page_not_found(e):
@@ -530,12 +574,6 @@ def page_not_found(e):
         return send_from_directory(HUGO_PATH, "404.html"), 404
     except:
         return "404 Not Found", 404
-
-
-# Azure container apps health check
-@app.route("/liveness")
-def health_check():
-    return "OK", 200
 
 
 if __name__ == "__main__":
