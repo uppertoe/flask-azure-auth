@@ -1,11 +1,9 @@
 import os
 import sys
 import logging
-import base64
 import requests
 import json
 import msal
-import jwt
 from flask import (
     Flask,
     redirect,
@@ -24,15 +22,16 @@ from flask_wtf import CSRFProtect
 from flask_wtf.csrf import CSRFError, validate_csrf, generate_csrf
 from urllib.parse import urlparse, urljoin, unquote
 from dotenv import load_dotenv
-from datetime import datetime, timedelta, timezone
-from jwt import InvalidSignatureError, ExpiredSignatureError, InvalidTokenError
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
+from datetime import timedelta
+from jwt import InvalidTokenError
 from werkzeug.exceptions import NotFound
+from utils import TokenDecoder
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
+"""
+Initialise Flask
+"""
 # Load .env only in development
 load_dotenv(".env")
 
@@ -40,6 +39,13 @@ load_dotenv(".env")
 app = Flask(__name__)
 
 app.logger.setLevel(logging.INFO)
+
+# Initialize CSRF Protection
+csrf = CSRFProtect(app)
+
+"""
+App Variables
+"""
 
 # Set app variables
 app.secret_key = os.getenv("SECRET_KEY", "default_secret_key")
@@ -76,15 +82,24 @@ if SERVE_DIRECTORY not in ["public", "temp"]:
 HUGO_PATH = os.path.join(MOUNT_PATH, SERVE_DIRECTORY)
 SESSION_PATH = os.path.join(MOUNT_PATH, "flask_sessions")
 
+# Ensure the public/ and temp/ directories exist
+PUBLIC_DIR = os.path.join(MOUNT_PATH, "public")
+TEMP_DIR = os.path.join(MOUNT_PATH, "temp")
+
+"""
+Initialise Session
+"""
 # Configure Flask-Session to use the file system
 app.config["SESSION_TYPE"] = "filesystem"  # Use file system for sessions
 app.config["SESSION_FILE_DIR"] = SESSION_PATH  # Directory for session files
 app.config["SESSION_PERMANENT"] = True  # Permanent session
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)  # Session lasts 7 days
+Session(app)
 
-# Ensure the public/ and temp/ directories exist
-PUBLIC_DIR = os.path.join(MOUNT_PATH, "public")
-TEMP_DIR = os.path.join(MOUNT_PATH, "temp")
+
+"""
+Helper Functions
+"""
 
 
 def create_directories():
@@ -99,14 +114,7 @@ def create_directories():
 
 create_directories()  # Call on app start
 
-# Initialize Flask-Session
-Session(app)
 
-# Initialize CSRF Protection
-csrf = CSRFProtect(app)
-
-
-# Helper Functions
 def is_authenticated():
     # Initialize MSAL app and cache within the request context
     msal_app, cache = get_msal_app()
@@ -148,33 +156,11 @@ def is_safe_url(target):
     return test_url.scheme in ("http", "https") and ref_url.netloc == test_url.netloc
 
 
-def base64url_to_int(val):
-    """Decodes a base64url-encoded string to an integer."""
-    # Add padding if necessary
-    val = val + "=" * (4 - len(val) % 4)
-    decoded = base64.urlsafe_b64decode(val)
-    return int.from_bytes(decoded, "big")
+"""
+HTTP Security Settings
+"""
 
 
-def get_public_key(jwks, kid):
-    for key in jwks["keys"]:
-        if key["kid"] == kid:
-            n = base64url_to_int(
-                key["n"]
-            )  # Convert the base64url-encoded modulus to an integer
-            e = base64url_to_int(
-                key["e"]
-            )  # Convert the base64url-encoded exponent to an integer
-            public_key = rsa.RSAPublicNumbers(e, n).public_key(default_backend())
-
-            return public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-    raise ValueError("Public key not found.")
-
-
-# Enforce HTTPS
 @app.before_request
 def check_https():
     if not app.debug:
@@ -221,9 +207,9 @@ def add_cache_headers(response):
     return response
 
 
-"""Routes"""
-
-# MSAL Authentication flow
+"""
+MSAL Authentication Flow
+"""
 
 
 def get_msal_app():
@@ -243,6 +229,87 @@ def get_msal_app():
     )
 
     return msal_app, cache
+
+
+@app.route("/login/authorized")
+def authorized():
+    """
+    The second part of the OAuth2 authentication flow
+    If login was successful, a code is returned which can be exchanged for an access token
+    This token will be stored in cache on the server filesystem
+    """
+
+    """Check request parameters"""
+    # Check if the state parameter is valid
+    if request.args.get("state") != session.get("state"):
+        app.logger.warning("State parameter mismatch or missing. Redirecting to login.")
+        return redirect(
+            url_for("login", next=session.get("next_url", url_for("index")))
+        )
+
+    if "error" in request.args:
+        return f"Error: {request.args.get('error_description')}", 400
+
+    code = request.args.get("code")
+    if not code:
+        abort(400, description="Authorization code not found.")
+
+    """Get the access token"""
+    # Get the MSAL app and the token cache
+    msal_app, cache = get_msal_app()
+
+    # Get the access token using the code from the login
+    result = msal_app.acquire_token_by_authorization_code(
+        code, scopes=AZURE_SCOPE, redirect_uri=REDIRECT_URI
+    )
+
+    """Check the access token"""
+    if "error" in result:
+        return f"Error: {result.get('error_description')}", 400
+
+    id_token = result.get("id_token")
+    if not id_token:
+        return "Authentication failed: ID token not found.", 400
+
+    # Initialize the TokenDecoder with your tenant_id and client_id
+    token_decoder = TokenDecoder(tenant_id=AZURE_TENANT_ID, client_id=AZURE_CLIENT_ID)
+
+    # Decode the ID token and extract claims
+    try:
+        claims = token_decoder.decode_token(id_token)
+    except InvalidTokenError as e:
+        app.logger.info(f"Error: {str(e)}")
+        return "Failed to decode ID token.", 400
+
+    """Verify additional claims"""
+    if claims.get("iss") != f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/v2.0":
+        return "Invalid token issuer.", 403
+
+    if claims.get("tid") != AZURE_TENANT_ID:
+        return "Unauthorized tenant.", 403
+
+    user_email = claims.get("email") or claims.get("upn")
+    if not user_email or not user_email.endswith(ALLOWED_EMAIL_DOMAIN):
+        return "Unauthorized user.", 403
+
+    user_groups = claims.get("groups", [])
+    allowed_group_ids = [group_id for group_id in ALLOWED_GROUP_IDS if group_id]
+    if allowed_group_ids and not any(
+        group_id in allowed_group_ids for group_id in user_groups
+    ):
+        return "User does not belong to an authorized group.", 403
+
+    """Update the cache"""
+    if cache.has_state_changed:
+        session["token_cache"] = cache.serialize()
+
+    session["user"] = {
+        "name": claims.get("name"),
+        "email": user_email,
+    }
+
+    # Redirect to the stored 'next_url' or the index
+    return redirect(session.pop("next_url", url_for("index")))
 
 
 @app.route("/login")
@@ -280,106 +347,16 @@ def login():
     return redirect(auth_url)
 
 
-@app.route("/login/authorized")
-def authorized():
-    """
-    The second part of the OAuth2 authentication flow
-    If login was successful, a code is returned which can be exchanged for an access token
-    This token will be stored in cache on the server filesystem
-    """
-    # Check if the state parameter is valid
-    if request.args.get("state") != session.get("state"):
-        app.logger.warning("State parameter mismatch or missing. Redirecting to login.")
-        return redirect(
-            url_for("login", next=session.get("next_url", url_for("index")))
-        )
-
-    if "error" in request.args:
-        return f"Error: {request.args.get('error_description')}", 400
-
-    code = request.args.get("code")
-    if not code:
-        abort(400, description="Authorization code not found.")
-
-    # Get the MSAL app and the token cache
-    msal_app, cache = get_msal_app()
-
-    # Get the access token using the code from the login
-    result = msal_app.acquire_token_by_authorization_code(
-        code, scopes=AZURE_SCOPE, redirect_uri=REDIRECT_URI
-    )
-
-    if "error" in result:
-        return f"Error: {result.get('error_description')}", 400
-
-    id_token = result.get("id_token")
-    if not id_token:
-        return "Authentication failed: ID token not found.", 400
-
-    """Verify the token against the Azure tenant public key, and extract claims"""
-    # Get public keys from Azure AD
-    jwks_url = (
-        f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys"
-    )
-    jwks = requests.get(jwks_url).json()
-
-    # Extract the key ID (kid) from the token header
-    unverified_header = jwt.get_unverified_header(id_token)
-    kid = unverified_header["kid"]
-
-    try:
-        # Get the PEM-formatted public key
-        public_key = get_public_key(jwks, kid)
-
-        # Decode the JWT
-        claims = jwt.decode(
-            id_token, public_key, algorithms=["RS256"], audience=AZURE_CLIENT_ID
-        )
-    except ExpiredSignatureError:
-        return "Token has expired.", 401
-    except InvalidSignatureError:
-        return "Invalid token signature.", 401
-    except InvalidTokenError:
-        return "Invalid token.", 401
-    except Exception as e:
-        return str(e), 400
-
-    # Verify additional claims
-    if claims.get("iss") != f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/v2.0":
-        return "Invalid token issuer.", 403
-
-    if claims.get("tid") != AZURE_TENANT_ID:
-        return "Unauthorized tenant.", 403
-
-    user_email = claims.get("email") or claims.get("upn")
-    if not user_email or not user_email.endswith(ALLOWED_EMAIL_DOMAIN):
-        return "Unauthorized user.", 403
-
-    user_groups = claims.get("groups", [])
-    allowed_group_ids = [group_id for group_id in ALLOWED_GROUP_IDS if group_id]
-    if allowed_group_ids and not any(
-        group_id in allowed_group_ids for group_id in user_groups
-    ):
-        return "User does not belong to an authorized group.", 403
-
-    # Serialize the updated token cache back to the session if the cache has changed
-    if cache.has_state_changed:
-        session["token_cache"] = cache.serialize()
-
-    session["user"] = {
-        "name": claims.get("name"),
-        "email": user_email,
-    }
-
-    # Redirect to the stored 'next_url' or the index
-    return redirect(session.pop("next_url", url_for("index")))
-
-
 @app.route("/logout")
 def logout():
     session.clear()
     logout_url = f"{AZURE_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('index', _external=True)}"
     return redirect(logout_url)
+
+
+"""
+Azure Container Routes
+"""
 
 
 # Azure container apps health check
@@ -388,42 +365,9 @@ def health_check():
     return "OK", 200
 
 
-@app.route("/favicon.ico")
-@app.route("/robots.txt")
-@app.route("/android-chrome-192x192.png")
-@app.route("/android-chrome-512x512.png")
-@app.route("/apple-touch-icon.png")
-@app.route("/favicon-16x16.png")
-@app.route("/favicon-32x32.png")
-def serve_public_static_files():
-    return send_from_directory(
-        HUGO_PATH, request.path[1:]
-    )  # Removes the leading '/' from the path
-
-
-"""Decap CMS"""
-
-
-# Serve DecapCMS routes without auth
-@app.route("/cms")
-def decap_admin():
-    # Ensure logged in
-    if not app.debug and not is_authenticated():
-        return redirect(url_for("login", next=request.url))
-
-    if not app.debug and not cms_is_authenticated():
-        # If not on CMS authorised users list
-        return abort(
-            403, "Please contact an administrator if you require CMS access"
-        )  # Block unauthenticated users
-
-    # Get the admin template for rendering
-    admin_template_path = os.path.join(HUGO_PATH, "admin/index.html")
-    with open(admin_template_path, "r") as file:
-        template_content = file.read()
-
-    # Render the content (including CSRF + CMS)
-    return render_template_string(template_content)
+"""
+Decap CMS
+"""
 
 
 @app.route("/cms/config.yml")
@@ -442,7 +386,7 @@ def decap_css():
 
 def get_auth_message(succeed=False):
     if succeed:
-        content = json.dumps({"token": "2", "provider": "github"})
+        content = json.dumps({"token": "", "provider": "github"})
         message = "success"
     else:
         content = "Error: you are not authorised to access the CMS"
@@ -473,8 +417,7 @@ def proxy_request():
     token = request.headers.get(
         "X-CSRF-Token"
     )  # Assuming the CSRF token is sent in the header
-    print(f"Received Token: {token}")
-    print(f"Session Token: {session.get('csrf_token')}")
+
     if not token:
         abort(400, description="Missing CSRF token")
     try:
@@ -560,6 +503,54 @@ def proxy_request():
         )
 
 
+# Serve DecapCMS routes without auth
+@app.route("/cms")
+def decap_admin():
+    # Ensure logged in
+    if not app.debug and not is_authenticated():
+        return redirect(url_for("login", next=request.url))
+
+    if not app.debug and not cms_is_authenticated():
+        # If not on CMS authorised users list
+        return abort(
+            403, "Please contact an administrator if you require CMS access"
+        )  # Block unauthenticated users
+
+    # Get the admin template for rendering
+    admin_template_path = os.path.join(HUGO_PATH, "admin/index.html")
+    with open(admin_template_path, "r") as file:
+        template_content = file.read()
+
+    # Render the content (including CSRF + CMS)
+    return render_template_string(template_content)
+
+
+"""
+Static Web App Routes
+"""
+
+
+@app.route("/favicon.ico")
+@app.route("/robots.txt")
+@app.route("/android-chrome-192x192.png")
+@app.route("/android-chrome-512x512.png")
+@app.route("/apple-touch-icon.png")
+@app.route("/favicon-16x16.png")
+@app.route("/favicon-32x32.png")
+def serve_public_static_files():
+    return send_from_directory(
+        HUGO_PATH, request.path[1:]
+    )  # Removes the leading '/' from the path
+
+
+@app.route("/")
+def index():
+    if app.debug or is_authenticated():
+        return send_from_directory(HUGO_PATH, "index.html")
+    # Render the landing page if not authenticated
+    return render_template("landing.html")
+
+
 @app.route("/<path:path>")
 def serve_static(path):
     """
@@ -604,14 +595,6 @@ def serve_static(path):
         return send_from_directory(HUGO_PATH, html_file)
     except NotFound:
         abort(404)
-
-
-@app.route("/")
-def index():
-    if app.debug or is_authenticated():
-        return send_from_directory(HUGO_PATH, "index.html")
-    # Render the landing page if not authenticated
-    return render_template("landing.html")
 
 
 # Custom 404 Error Page
