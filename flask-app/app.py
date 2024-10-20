@@ -53,9 +53,6 @@ if not app.debug:
     app.config["SESSION_COOKIE_SAMESITE"] = (
         "Lax"  # Prevents CSRF attacks during third-party contexts
     )
-    app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
-        hours=1
-    )  # Set session expiration
 
 # Load configurations from environment variables
 AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
@@ -108,28 +105,32 @@ Session(app)
 # Initialize CSRF Protection
 csrf = CSRFProtect(app)
 
-# Initialize MSAL Confidential Client
-msal_app = msal.ConfidentialClientApplication(
-    AZURE_CLIENT_ID,
-    authority=AZURE_AUTHORITY,
-    client_credential=AZURE_CLIENT_SECRET,
-    token_cache=None,  # Configure token cache as needed
-)
-
 
 # Helper Functions
 def is_authenticated():
-    token = session.get("azure_token")
-    expires_at = session.get("expires_at")
+    # Initialize MSAL app and cache within the request context
+    msal_app, cache = get_msal_app()
 
-    # Check that both token and expiration exist and expiration hasn't passed
-    if token and expires_at:
-        if datetime.now(tz=timezone.utc) < expires_at:
+    # Deserialize the cache from session, if available
+    if session.get("token_cache"):
+        cache.deserialize(session["token_cache"])
+
+    # Check if there are any accounts in the cache
+    accounts = msal_app.get_accounts()
+    if accounts:
+        # Try to acquire the token silently from the cache
+        result = msal_app.acquire_token_silent(scopes=AZURE_SCOPE, account=accounts[0])
+        if result and "access_token" in result:
+            # Serialize the updated cache back to the session if the cache changed
+            if cache.has_state_changed:
+                session["token_cache"] = cache.serialize()
             return True
-
-    # If token is missing or expired, clear the session
-    session.clear()
-    return False
+        else:
+            # Token is expired or missing, needs re-authentication
+            return False
+    else:
+        # No accounts found in the cache, user is not authenticated
+        return False
 
 
 def cms_is_authenticated():
@@ -196,7 +197,7 @@ def set_security_headers(response):
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Strict-Transport-Security"] = (
         "max-age=31536000; includeSubDomains"
     )
@@ -222,15 +223,37 @@ def add_cache_headers(response):
 
 """Routes"""
 
+# MSAL Authentication flow
 
-# Azure container apps health check
-@app.route("/liveness")
-def health_check():
-    return "OK", 200
+
+def get_msal_app():
+    # Initialize the cache inside the request context
+    cache = msal.SerializableTokenCache()
+
+    # Load the cache from the session
+    if session.get("token_cache"):
+        cache.deserialize(session["token_cache"])
+
+    # Initialize the MSAL app with the token cache
+    msal_app = msal.ConfidentialClientApplication(
+        AZURE_CLIENT_ID,
+        authority=AZURE_AUTHORITY,
+        client_credential=AZURE_CLIENT_SECRET,
+        token_cache=cache,  # Pass in the cache
+    )
+
+    return msal_app, cache
 
 
 @app.route("/login")
 def login():
+    """
+    The first part of the OAuth2 flow
+    Returns an authorisation URL provided by MSAL
+    Users log in at this URL, which redirects back to this app with:
+    - A code that can be exchanged for an authorization token
+    - The state set here (to prevent CSRF attacks)
+    """
     app.logger.info(f"Login attempt for URL: {request.url}")
 
     # Store the original URL in the session (from 'next' parameter or referer)
@@ -241,23 +264,29 @@ def login():
         next_url = url_for("index")  # Default to index if the URL is unsafe
 
     session["next_url"] = next_url
-
     session["state"] = os.urandom(24).hex()
+
+    # Get the MSAL app and the token cache
+    msal_app, cache = get_msal_app()
+
     auth_url = msal_app.get_authorization_request_url(
         scopes=AZURE_SCOPE, redirect_uri=REDIRECT_URI, state=session["state"]
     )
+
+    # Serialize and store the cache if it changed
+    if cache.has_state_changed:
+        session["token_cache"] = cache.serialize()
+
     return redirect(auth_url)
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    logout_url = f"{AZURE_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('index', _external=True)}"
-    return redirect(logout_url)
 
 
 @app.route("/login/authorized")
 def authorized():
+    """
+    The second part of the OAuth2 authentication flow
+    If login was successful, a code is returned which can be exchanged for an access token
+    This token will be stored in cache on the server filesystem
+    """
     # Check if the state parameter is valid
     if request.args.get("state") != session.get("state"):
         app.logger.warning("State parameter mismatch or missing. Redirecting to login.")
@@ -272,6 +301,10 @@ def authorized():
     if not code:
         abort(400, description="Authorization code not found.")
 
+    # Get the MSAL app and the token cache
+    msal_app, cache = get_msal_app()
+
+    # Get the access token using the code from the login
     result = msal_app.acquire_token_by_authorization_code(
         code, scopes=AZURE_SCOPE, redirect_uri=REDIRECT_URI
     )
@@ -283,6 +316,7 @@ def authorized():
     if not id_token:
         return "Authentication failed: ID token not found.", 400
 
+    """Verify the token against the Azure tenant public key, and extract claims"""
     # Get public keys from Azure AD
     jwks_url = (
         f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys"
@@ -328,11 +362,10 @@ def authorized():
     ):
         return "User does not belong to an authorized group.", 403
 
-    # Store token and session data
-    session["azure_token"] = result
-    session["expires_at"] = datetime.now(tz=timezone.utc) + timedelta(
-        seconds=result["expires_in"]
-    )
+    # Serialize the updated token cache back to the session if the cache has changed
+    if cache.has_state_changed:
+        session["token_cache"] = cache.serialize()
+
     session["user"] = {
         "name": claims.get("name"),
         "email": user_email,
@@ -340,6 +373,19 @@ def authorized():
 
     # Redirect to the stored 'next_url' or the index
     return redirect(session.pop("next_url", url_for("index")))
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    logout_url = f"{AZURE_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('index', _external=True)}"
+    return redirect(logout_url)
+
+
+# Azure container apps health check
+@app.route("/liveness")
+def health_check():
+    return "OK", 200
 
 
 @app.route("/favicon.ico")
@@ -450,6 +496,7 @@ def proxy_request():
     headers["Authorization"] = f"token {CMS_GITHUB_TOKEN}"
     headers["Accept"] = "application/vnd.github+json"
     headers["X-GitHub-Api-Version"] = "2022-11-28"
+    headers["Referer"] = request.url_root
 
     # Remove problematic headers
     headers.pop("Host", None)

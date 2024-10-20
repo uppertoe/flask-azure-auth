@@ -91,6 +91,7 @@ venv/
 # Flask
 flask-app/flask_sessions/
 flask-app/public/
+flask-app/temp/
 flask-app/.venv
 flask-app/.env
 

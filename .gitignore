@@ -203,4 +203,4 @@ cython_debug/
 .azure/
 
 # CLI logs
-management/logs/
+deploy/logs/

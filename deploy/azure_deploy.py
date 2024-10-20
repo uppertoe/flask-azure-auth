@@ -11,7 +11,6 @@ import tempfile
 import dns.resolver
 import tldextract
 import datetime
-from functools import wraps
 from azure.identity import AzureCliCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
@@ -27,7 +26,7 @@ from dotenv import load_dotenv
 from nacl import public
 
 # Load environment variables from the .env file
-load_dotenv(".container-env")
+load_dotenv(".env")
 
 # Load variables from .env
 AZURE_APP_NAME = os.getenv("AZURE_APP_NAME")
@@ -47,8 +46,8 @@ MOUNT_PATH = os.getenv("MOUNT_PATH")
 
 # GitHub Variables
 GITHUB_REPO = os.getenv("GITHUB_REPO")  # Format: "owner/repo"
-GITHUB_TOKEN = os.getenv(
-    "GITHUB_TOKEN"
+GITHUB_SECRETS_TOKEN = os.getenv(
+    "GITHUB_SECRETS_TOKEN"
 )  # GitHub token with permissions to modify secrets
 CMS_GITHUB_TOKEN = os.getenv("CMS_GITHUB_TOKEN")
 CMS_ALLOWED_EMAILS = os.getenv("CMS_ALLOWED_EMAILS")
@@ -264,15 +263,29 @@ def mount_azure_file_share_in_container(storage_account_key):
 def register_resource_provider():
     # Required for container environment
     print(
-        "Registering Microsoft.OperationalInsights provider if not already registered..."
+        "Registering Microsoft.OperationalInsights and Microsoft.App providers if not already registered..."
     )
 
     run_azure_cli(
-        ["az", "provider", "register", "-n", "Microsoft.OperationalInsights", "--wait"],
+        [
+            "az",
+            "provider",
+            "register",
+            "-namespace",
+            "Microsoft.OperationalInsights",
+            "--wait",
+        ],
         check=True,
     )
 
-    print("Microsoft.OperationalInsights provider registered successfully.")
+    run_azure_cli(
+        ["az", "provider", "register", "-n", "Microsoft.App", "--wait"],
+        check=True,
+    )
+
+    print(
+        "Microsoft.OperationalInsights and Microsoft.App provider registered successfully."
+    )
 
 
 def create_container_environment_if_not_exists():
@@ -350,12 +363,6 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
           scale:
             minReplicas: 1
             maxReplicas: 1
-            rules:
-            - name: httpscalingrule
-              custom:
-                type: http
-                metadata:
-                  concurrentRequests: '50'
           volumes:
           - name: azure-files-volume
             storageType: AzureFile
@@ -1075,7 +1082,7 @@ def update_github_secret(secret_name, secret_value):
     print(f"Updating GitHub secret: {secret_name}...")
 
     headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
+        "Authorization": f"token {GITHUB_SECRETS_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -1136,13 +1143,12 @@ def orchestrate_custom_domain():
 # Main function to provision and deploy resources
 def main():
     try:
+        register_resource_provider()  # Microsoft.OperationalInsights and Microsoft.App
         create_resource_group_if_not_exists()
 
         storage_account_key = provision_azure_file_share()
-        mount_azure_file_share_in_container(storage_account_key)
 
         # Create or check the Azure Container App Environment
-        register_resource_provider()
         create_container_environment_if_not_exists()
 
         app_id, ad_client_id = register_or_get_azure_ad_app()
@@ -1151,6 +1157,8 @@ def main():
 
         # Create the Azure Container App, passing the client ID and secret
         container_app = create_azure_container_app(ad_client_id, sp_client_secret)
+
+        mount_azure_file_share_in_container(storage_account_key)
 
         update_github_secret("AZURE_CREDENTIALS", json_creds)
         update_github_secret("AZURE_CONTAINER_APP_NAME", AZURE_APP_NAME)
