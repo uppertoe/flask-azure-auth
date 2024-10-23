@@ -4,6 +4,7 @@ import json
 import random
 import string
 import time
+import secrets
 import requests
 import base64
 import subprocess
@@ -27,6 +28,16 @@ from nacl import public
 
 # Load environment variables from the .env file
 load_dotenv(".env")
+
+"""
+Script Settings
+"""
+
+ENABLE_RESOURCE_PROVIDER_PROVISIONING = False
+
+"""
+Environment Variables
+"""
 
 # Load variables from .env
 AZURE_APP_NAME = os.getenv("AZURE_APP_NAME")
@@ -59,6 +70,33 @@ CONTAINER_ENV_NAME = os.getenv("CONTAINER_ENV_NAME", f"{AZURE_APP_NAME}-env")
 GUNICORN_PORT = 8000
 FLASK_SECRET_KEY = "".join(random.choices(string.ascii_letters + string.digits, k=32))
 SERVE_DIRECTORY = "public"  # Switch to temp/ for zero-downtime Hugo deployment
+FLASK_SESSION_LIFETIME_DAYS = os.getenv("SESSION_LIFETIME_DAYS")
+FLASK_LANDING_PAGE_MESSAGE = os.getenv("LANDING_PAGE_MESSAGE")
+
+"""
+Set webhooks
+"""
+
+
+def generate_random_webhook_secret(length=32):
+    """
+    Generates a random string for the webhook secret.
+
+    :param length: The length of the random string (default is 32 characters).
+    :return: A secure random string.
+    """
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+WEBHOOK_URL = f"https://{CUSTOM_DOMAIN}/webhook/"
+WEBHOOK_CURRENT_SERVE_DIRECTORY = generate_random_webhook_secret()
+print(WEBHOOK_CURRENT_SERVE_DIRECTORY)
+WEBHOOK_TOGGLE_SERVE_DIRECTORY = generate_random_webhook_secret()
+print(WEBHOOK_TOGGLE_SERVE_DIRECTORY)
+"""
+Azure CLI
+"""
 
 # Use Azure CLI for authentication
 credential = AzureCliCredential()
@@ -73,6 +111,10 @@ log_filename = (
     f"logs/deploy_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 )
 command_summary = []
+
+"""
+Create Logfile
+"""
 
 
 # Function to log command output, appending to the same file
@@ -124,7 +166,9 @@ def write_command_summary():
         )  # Write the existing detailed logs after the summary
 
 
-"""Commands"""
+"""
+Commands
+"""
 
 
 # Function to create the resource group if it doesn't exist
@@ -271,7 +315,7 @@ def register_resource_provider():
             "az",
             "provider",
             "register",
-            "-namespace",
+            "-n",
             "Microsoft.OperationalInsights",
             "--wait",
         ],
@@ -379,8 +423,8 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
               httpGet:
                 path: "/liveness"
                 port: 8000
-              initialDelaySeconds: 5
-              periodSeconds: 10
+              initialDelaySeconds: 20
+              periodSeconds: 30
             volumeMounts:
             - mountPath: "/mnt"
               volumeName: azure-files-volume
@@ -405,6 +449,20 @@ def create_azure_container_app(ad_client_id, sp_client_secret):
               value: {CMS_ALLOWED_EMAILS}
             - name: CMS_GITHUB_TOKEN
               value: {CMS_GITHUB_TOKEN}
+            - name: SESSION_LIFETIME_DAYS
+              value: {FLASK_SESSION_LIFETIME_DAYS}
+            - name: LANDING_PAGE_MESSAGE
+              value: {FLASK_LANDING_PAGE_MESSAGE}
+            - name: WEBHOOK_CURRENT_SERVE_DIRECTORY
+              value: {WEBHOOK_CURRENT_SERVE_DIRECTORY}
+            - name: WEBHOOK_TOGGLE_SERVE_DIRECTORY
+              value: {WEBHOOK_TOGGLE_SERVE_DIRECTORY}
+            - name: WEBHOOK_URL
+              value: {WEBHOOK_URL}
+            - name: GITHUB_SECRETS_TOKEN
+              value: {GITHUB_SECRETS_TOKEN}
+            - name: GITHUB_REPO
+              value: {GITHUB_REPO}
     """
 
     # Conditionally include ALLOWED_GROUP_IDS only if it has a value
@@ -1143,7 +1201,9 @@ def orchestrate_custom_domain():
 # Main function to provision and deploy resources
 def main():
     try:
-        register_resource_provider()  # Microsoft.OperationalInsights and Microsoft.App
+        if ENABLE_RESOURCE_PROVIDER_PROVISIONING:
+            register_resource_provider()  # Microsoft.OperationalInsights and Microsoft.App
+
         create_resource_group_if_not_exists()
 
         storage_account_key = provision_azure_file_share()
@@ -1165,6 +1225,13 @@ def main():
         update_github_secret("AZURE_RESOURCE_GROUP", AZURE_RESOURCE_GROUP)
         update_github_secret("AZURE_STORAGE_ACCOUNT_NAME", AZURE_STORAGE_ACCOUNT_NAME)
         update_github_secret("AZURE_FILE_SHARE_NAME", AZURE_FILE_SHARE_NAME)
+        update_github_secret(
+            "WEBHOOK_CURRENT_SERVE_DIRECTORY", WEBHOOK_CURRENT_SERVE_DIRECTORY
+        )
+        update_github_secret(
+            "WEBHOOK_TOGGLE_SERVE_DIRECTORY", WEBHOOK_TOGGLE_SERVE_DIRECTORY
+        )
+        update_github_secret("WEBHOOK_URL", WEBHOOK_URL)
 
         orchestrate_custom_domain()
 

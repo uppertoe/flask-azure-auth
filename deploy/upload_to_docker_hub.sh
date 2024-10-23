@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# Load environment variables from .container-env file
-if [[ -f .container-env ]]; then
+# Load environment variables from .env file
+if [[ -f .env ]]; then
   while IFS='=' read -r key value; do
     if [[ ! $key =~ ^\s*# && -n $key ]]; then
       export "$key"="${value//\"/}"
     fi
-  done < .container-env
+  done < .env
 else
-  echo ".container-env file not found!"
+  echo ".env file not found!"
   exit 1
 fi
 
