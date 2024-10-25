@@ -3,19 +3,25 @@ import sys
 import logging
 import requests
 import json
+import string
+import secrets
+import time
+import uuid
+import fcntl
 import msal
 from flask import (
     Flask,
     redirect,
     url_for,
-    session,
     request,
+    session,
     abort,
     send_from_directory,
     render_template,
     jsonify,
     render_template_string,
     Response,
+    make_response,
 )
 from flask_session import Session
 from flask_wtf import CSRFProtect
@@ -23,9 +29,9 @@ from flask_wtf.csrf import CSRFError, validate_csrf, generate_csrf
 from urllib.parse import urlparse, urljoin, unquote
 from dotenv import load_dotenv
 from datetime import timedelta
-from jwt import InvalidTokenError
 from werkzeug.exceptions import NotFound
-from utils import TokenDecoder
+from apscheduler.schedulers.background import BackgroundScheduler
+from utils import GitHubSecretUpdater
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
@@ -70,21 +76,18 @@ ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN")
 ALLOWED_GROUP_IDS = os.getenv("ALLOWED_GROUP_IDS", "").split(",")
 CMS_ALLOWED_EMAILS = os.getenv("CMS_ALLOWED_EMAILS", "").split(",")
 CMS_GITHUB_TOKEN = os.getenv("CMS_GITHUB_TOKEN")
+GITHUB_SECRETS_TOKEN = os.getenv("GITHUB_SECRETS_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")
 
 # Set other variables
 AZURE_AUTHORITY = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
 MOUNT_PATH = "" if app.debug else os.getenv("MOUNT_PATH", "/mnt")
-SERVE_DIRECTORY = os.getenv(
-    "SERVE_DIRECTORY", "public"
-)  # Switch to temp/ for zero-downtime deploy
-if SERVE_DIRECTORY not in ["public", "temp"]:
-    raise RuntimeError(f"Invalid SERVE_DIRECTORY: {SERVE_DIRECTORY} - exiting.")
-HUGO_PATH = os.path.join(MOUNT_PATH, SERVE_DIRECTORY)
-SESSION_PATH = os.path.join(MOUNT_PATH, "flask_sessions")
+SESSION_PATH = "flask_sessions"
+SESSION_LIFETIME_DAYS = int(os.getenv("SESSION_LIFETIME_DAYS", 7))
+LANDING_PAGE_MESSAGE = os.getenv(
+    "LANDING_PAGE_MESSAGE", "Welcome to the Flask Authentication App"
+)
 
-# Ensure the public/ and temp/ directories exist
-PUBLIC_DIR = os.path.join(MOUNT_PATH, "public")
-TEMP_DIR = os.path.join(MOUNT_PATH, "temp")
 
 """
 Initialise Session
@@ -93,56 +96,41 @@ Initialise Session
 app.config["SESSION_TYPE"] = "filesystem"  # Use file system for sessions
 app.config["SESSION_FILE_DIR"] = SESSION_PATH  # Directory for session files
 app.config["SESSION_PERMANENT"] = True  # Permanent session
-app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)  # Session lasts 7 days
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
+    days=SESSION_LIFETIME_DAYS
+)  # Session lasts 7 days
+SESSION_COOKIE_NAME = app.config.get("SESSION_COOKIE_NAME", "session")
 Session(app)
-
 
 """
 Helper Functions
 """
 
 
-def create_directories():
-    try:
-        # Create /public and /temp directories if they don't exist
-        os.makedirs(PUBLIC_DIR, exist_ok=True)
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        print(f"Directories '/public' and '/temp' created or already exist.")
-    except Exception as e:
-        print(f"Error creating directories: {e}")
-
-
-create_directories()  # Call on app start
-
-
 def is_authenticated():
-    # Initialize MSAL app and cache within the request context
-    msal_app, cache = get_msal_app()
-
-    # Deserialize the cache from session, if available
-    if session.get("token_cache"):
-        cache.deserialize(session["token_cache"])
-
-    # Check if there are any accounts in the cache
-    accounts = msal_app.get_accounts()
-    if accounts:
-        # Try to acquire the token silently from the cache
-        result = msal_app.acquire_token_silent(scopes=AZURE_SCOPE, account=accounts[0])
-        if result and "access_token" in result:
-            # Serialize the updated cache back to the session if the cache changed
-            if cache.has_state_changed:
-                session["token_cache"] = cache.serialize()
-            return True
-        else:
-            # Token is expired or missing, needs re-authentication
-            return False
-    else:
-        # No accounts found in the cache, user is not authenticated
+    # If there is no token cache in the session, not authenticated
+    token_cache = load_cache()
+    if not token_cache:
         return False
+
+    # Calls load_cache
+    msal_app = build_msal_app()
+    accounts = msal_app.get_accounts()
+
+    if accounts:
+        token_response = msal_app.acquire_token_silent(
+            scopes=AZURE_SCOPE,
+            account=accounts[0],  # Use the first account in the cache
+        )
+
+        if "access_token" in token_response:
+            return True  # User is authenticated
+
+    return False
 
 
 def cms_is_authenticated():
-    # Check if the user is authenticated by verifying their email in the session
+    """Check if the user is authenticated by verifying their email in the session"""
     user_email = session.get("user", {}).get("email")
     return user_email in CMS_ALLOWED_EMAILS and is_authenticated()
 
@@ -192,35 +180,284 @@ def set_security_headers(response):
 
 @app.after_request
 def add_cache_headers(response):
-    # Apply long cache duration for static assets (CSS, JS, images)
+    # Apply long cache duration for static assets
     if request.path.startswith("/static") or any(
         request.path.endswith(ext)
         for ext in [".css", ".js", ".png", ".jpg", ".gif", ".svg"]
     ):
-        response.headers["Cache-Control"] = (
-            "public, max-age=31536000"  # Cache static assets for 1 year
-        )
+        response.headers["Cache-Control"] = "public, max-age=31536000"
+    # Don't cache dynamic routes like logout, login, or authenticated content
+    elif request.endpoint in ["logout", "login", "authorized", "index"]:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
     else:
-        response.headers["Cache-Control"] = (
-            "public, max-age=3600"  # 1 hour for other content
-        )
+        # Default caching behavior for other routes (adjust as needed)
+        response.headers["Cache-Control"] = "public, max-age=3600"
     return response
 
+
+"""
+Webhooks
+"""
+
+
+def generate_random_webhook_secret(length=32):
+    """
+    Generates a random string for the webhook secret.
+
+    :param length: The length of the random string (default is 32 characters).
+    :return: A secure random string.
+    """
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+GREEN_DIR = os.path.join(MOUNT_PATH, "green/")
+BLUE_DIR = os.path.join(MOUNT_PATH, "blue/")
+SERVE_DIRECTORY_STATE_PATH = os.path.join(MOUNT_PATH, "state/serve_directory.txt")
+WEBHOOK_CURRENT_SERVE_DIRECTORY = os.getenv(
+    "WEBHOOK_CURRENT_SERVE_DIRECTORY", generate_random_webhook_secret()
+)
+WEBHOOK_TOGGLE_SERVE_DIRECTORY = os.getenv(
+    "WEBHOOK_TOGGLE_SERVE_DIRECTORY", generate_random_webhook_secret()
+)
+PASSWORD_FILE = os.path.join(MOUNT_PATH, "state/github_password.txt")
+PASSWORD_LIFETIME = 3600  # 1 hour in seconds
+
+if app.debug:
+    print(
+        f"curl -v -c cookies.txt -X GET http://127.0.0.1:8000/webhook/{WEBHOOK_CURRENT_SERVE_DIRECTORY}"
+    )
+    print(
+        f"Toggle webhook at http://127.0.0.1:8000/webhook/{WEBHOOK_TOGGLE_SERVE_DIRECTORY}"
+    )
+
+
+def ensure_directory_exists(path):
+    # Extract the direcotry from the file path
+    directory = os.path.dirname(path)
+    # Create the directory if it doesn't exist
+    if not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+        print(f"Created directory: {directory}")
+
+
+def ensure_file_exists(file_path):
+    if not os.path.exists(file_path):
+        with open(file_path, "w") as file:
+            file.write("")  # Write an empty string or initial content if needed
+        print(f"Created file: {file_path}")
+    else:
+        print(f"File already exists: {file_path}")
+
+
+# Ensure the paths exist on load
+ensure_directory_exists(GREEN_DIR)
+ensure_directory_exists(BLUE_DIR)
+ensure_directory_exists(SERVE_DIRECTORY_STATE_PATH)
+ensure_file_exists(SERVE_DIRECTORY_STATE_PATH)
+# Password directory in state/
+ensure_file_exists(PASSWORD_FILE)
+
+
+def check_current_serve_directory():
+    # Read the file to check its contents
+    with open(SERVE_DIRECTORY_STATE_PATH, "r") as file:
+        content = file.read().strip()
+
+        # Set the starting value if empty
+        if content not in ["blue", "green"]:
+            content = "green"
+            with open(SERVE_DIRECTORY_STATE_PATH, "w") as file:  # overwrite
+                file.write(content)
+
+        # Return the new content as plain text
+        return content.strip().lower()
+
+
+def toggle_current_serve_directory():
+    # Read the file to check its contents
+    with open(SERVE_DIRECTORY_STATE_PATH, "r") as file:
+        content = file.read().strip()
+
+        # Check if the content is 'blue' or 'green' and toggle
+        if content == "blue":
+            new_content = "green"
+        elif content == "green":
+            new_content = "blue"
+        else:
+            new_content = "green"  # Set new default
+
+        # Overwrite the file with the new content
+        with open(SERVE_DIRECTORY_STATE_PATH, "w") as file:
+            file.write(new_content)
+
+        # Return the new content as plain text
+        return new_content.strip().lower()
+
+
+# Read password and timestamp from file with non-blocking locking
+def read_password_file():
+    if not os.path.exists(PASSWORD_FILE):
+        return None, 0  # Return default values if file doesn't exist
+
+    try:
+        with open(PASSWORD_FILE, "r") as f:
+            # Try to acquire a shared lock in non-blocking mode
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            content = f.read().strip()
+            fcntl.flock(f, fcntl.LOCK_UN)  # Release the lock
+            if content:
+                password, timestamp = content.split(":")
+                return password, float(timestamp)
+    except BlockingIOError:
+        # Another worker is holding the lock, so we abandon the operation
+        app.logger.info(
+            "Password file is locked by another worker. Abandoning password generation."
+        )
+        return None, 0
+
+    return None, 0
+
+
+# Write new password and timestamp to file with non-blocking locking
+def write_password_file(password, timestamp):
+    try:
+        with open(PASSWORD_FILE, "w") as f:
+            # Try to acquire an exclusive lock in non-blocking mode
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f.write(f"{password}:{timestamp}")
+            fcntl.flock(f, fcntl.LOCK_UN)  # Release the lock
+    except BlockingIOError:
+        # Another worker is holding the lock, abandon the write
+        app.logger.info(
+            "Password file is locked by another worker. Abandoning write operation."
+        )
+        abort(500, description="Failed to update the password due to file lock.")
+
+
+# Generate a new password and update the file if older than 1 hour
+# Return a flag indicating whether the password was updated
+def generate_or_refresh_password(force=False):
+    current_time = time.time()
+    password, timestamp = read_password_file()
+
+    if password is None:
+        # File is locked, abandon the operation
+        return None, False
+
+    if (
+        current_time - timestamp > PASSWORD_LIFETIME or force
+    ):  # If password is older than 1 hour
+        new_password = str(uuid.uuid4())  # Generate a new password
+        write_password_file(
+            new_password, current_time
+        )  # Update the file with new password
+        return (
+            new_password,
+            True,
+        )  # Return the updated password and True (password changed)
+
+    return password, False  # Return the existing password and False (no change)
+
+
+# Send the password to GitHub Secrets
+def update_github_secret(password):
+    secret_updater = GitHubSecretUpdater(
+        GITHUB_REPO, GITHUB_SECRETS_TOKEN, debug=app.debug
+    )
+    secret_updater.update_secret("WORKFLOW_TOKEN", password)
+
+
+# Set the HUGO_PATH variable
+def set_hugo_path():
+    if app.debug:
+        path = os.path.join(MOUNT_PATH, "public")
+    else:
+        path = os.path.join(MOUNT_PATH, check_current_serve_directory())
+    return path
+
+
+HUGO_PATH = set_hugo_path()
+
+
+# Periodically check whether the HUGO_PATH has been updated
+def periodic_state_check():
+    global HUGO_PATH
+    HUGO_PATH = set_hugo_path()
+    app.logger.info(f"Active version set to {HUGO_PATH}")
+
+
+# Initialize the scheduler
+def start_scheduler():
+    scheduler = BackgroundScheduler()
+    # Add a job that runs every minute (or choose your desired interval)
+    scheduler.add_job(func=periodic_state_check, trigger="interval", seconds=60)
+    scheduler.start()
+
+
+start_scheduler()
+
+
+@app.route(f"/webhook/{WEBHOOK_CURRENT_SERVE_DIRECTORY}")
+def current_state():
+    current_directory = check_current_serve_directory()
+    return current_directory, 200
+
+
+@app.route(f"/webhook/{WEBHOOK_TOGGLE_SERVE_DIRECTORY}", methods=["POST"])
+@csrf.exempt
+def toggle_state():
+    request_password = request.headers.get("X-Webhook-Password")
+    password, _ = read_password_file()
+
+    if password and password == request_password:
+        # Toggle the serve directory
+        current_directory = toggle_current_serve_directory()
+    else:
+        update_github_secret(password)
+        return jsonify({"error": "Invalid Github Workflow token"}), 403
+
+    # Refresh the password
+    new_password, changed = generate_or_refresh_password(force=True)
+    if changed:
+        update_github_secret(new_password)
+
+    return current_directory, 200
+
+
+# On Flask app start, ensure password is up-to-date
+def initialise_password():
+    password, changed = generate_or_refresh_password()
+    if changed:
+        update_github_secret(password)
+
+
+initialise_password()
 
 """
 MSAL Authentication Flow
 """
 
 
-def get_msal_app():
-    # Initialize the cache inside the request context
-    cache = msal.SerializableTokenCache()
-
+def load_cache():
     # Load the cache from the session
-    if session.get("token_cache"):
+    cache = msal.SerializableTokenCache()
+    if "token_cache" in session:
         cache.deserialize(session["token_cache"])
+    return cache
 
+
+def save_cache(cache):
+    # Store the token cache in the session
+    if cache.has_state_changed:
+        session["token_cache"] = cache.serialize()
+
+
+def build_msal_app():
     # Initialize the MSAL app with the token cache
+    cache = load_cache()
     msal_app = msal.ConfidentialClientApplication(
         AZURE_CLIENT_ID,
         authority=AZURE_AUTHORITY,
@@ -228,7 +465,47 @@ def get_msal_app():
         token_cache=cache,  # Pass in the cache
     )
 
-    return msal_app, cache
+    return msal_app
+
+
+def validate_next(next_url):
+    if next_url:
+        # Ensure the URL is relative
+        parsed_url = urlparse(next_url)
+        if parsed_url.netloc == request.host:  # Only strip if it's the same host
+            next_url = parsed_url.path
+
+        if is_safe_url(next_url) and next_url != url_for("landing"):
+            return next_url
+
+    # Return index if none of the conditions are met
+    return url_for("index")
+
+
+@app.route("/login")
+def login():
+    """
+    The first part of the OAuth2 flow
+    Returns an authorisation URL provided by MSAL
+    Users log in at this URL, which redirects back to this app with:
+    - A code that can be exchanged for an authorization token
+    - The state set here (to prevent CSRF attacks)
+    """
+    # Store the original URL in the session (from 'next' parameter or referer)
+    next_url = request.args.get("next") or request.referrer or None
+
+    # Validate the next_url
+    next_url = validate_next(next_url)
+    session["next_url"] = next_url
+
+    msal_app = build_msal_app()
+    nonce = secrets.token_urlsafe(16)  # Generates a URL-safe, random string
+    session["state"] = nonce
+
+    auth_url = msal_app.get_authorization_request_url(
+        scopes=AZURE_SCOPE, redirect_uri=REDIRECT_URI, state=nonce
+    )
+    return redirect(auth_url)
 
 
 @app.route("/login/authorized")
@@ -243,9 +520,10 @@ def authorized():
     # Check if the state parameter is valid
     if request.args.get("state") != session.get("state"):
         app.logger.warning("State parameter mismatch or missing. Redirecting to login.")
-        return redirect(
-            url_for("login", next=session.get("next_url", url_for("index")))
-        )
+
+        # Only include 'next' parameter if it has a valid value
+        next_url = validate_next(session.get("next_url"))
+        return redirect(url_for("login", next=next_url))
 
     if "error" in request.args:
         return f"Error: {request.args.get('error_description')}", 400
@@ -255,103 +533,79 @@ def authorized():
         abort(400, description="Authorization code not found.")
 
     """Get the access token"""
-    # Get the MSAL app and the token cache
-    msal_app, cache = get_msal_app()
-
-    # Get the access token using the code from the login
-    result = msal_app.acquire_token_by_authorization_code(
+    # Get the MSAL app and acquire the token
+    msal_app = build_msal_app()
+    token_response = msal_app.acquire_token_by_authorization_code(
         code, scopes=AZURE_SCOPE, redirect_uri=REDIRECT_URI
     )
 
     """Check the access token"""
-    if "error" in result:
-        return f"Error: {result.get('error_description')}", 400
+    if "error" in token_response:
+        return f"Error: {token_response.get('error_description')}", 400
 
-    id_token = result.get("id_token")
+    id_token = token_response.get("id_token")
     if not id_token:
         return "Authentication failed: ID token not found.", 400
 
-    # Initialize the TokenDecoder with your tenant_id and client_id
-    token_decoder = TokenDecoder(tenant_id=AZURE_TENANT_ID, client_id=AZURE_CLIENT_ID)
-
-    # Decode the ID token and extract claims
-    try:
-        claims = token_decoder.decode_token(id_token)
-    except InvalidTokenError as e:
-        app.logger.info(f"Error: {str(e)}")
-        return "Failed to decode ID token.", 400
+    # Access decoded claims from the ID token
+    id_token_claims = token_response.get("id_token_claims")
 
     """Verify additional claims"""
-    if claims.get("iss") != f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/v2.0":
+    if (
+        id_token_claims.get("iss")
+        != f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/v2.0"
+    ):
         return "Invalid token issuer.", 403
 
-    if claims.get("tid") != AZURE_TENANT_ID:
+    if id_token_claims.get("tid") != AZURE_TENANT_ID:
         return "Unauthorized tenant.", 403
 
-    user_email = claims.get("email") or claims.get("upn")
+    user_email = id_token_claims.get("email") or id_token_claims.get("upn")
     if not user_email or not user_email.endswith(ALLOWED_EMAIL_DOMAIN):
         return "Unauthorized user.", 403
 
-    user_groups = claims.get("groups", [])
+    user_groups = id_token_claims.get("groups", [])
     allowed_group_ids = [group_id for group_id in ALLOWED_GROUP_IDS if group_id]
     if allowed_group_ids and not any(
         group_id in allowed_group_ids for group_id in user_groups
     ):
         return "User does not belong to an authorized group.", 403
 
-    """Update the cache"""
-    if cache.has_state_changed:
-        session["token_cache"] = cache.serialize()
-
-    session["user"] = {
-        "name": claims.get("name"),
-        "email": user_email,
-    }
+    # If checks are passed, save the token and details to the session
+    session["token_cache"] = msal_app.token_cache.serialize()
+    session["user"] = {"name": id_token_claims.get("name"), "email": user_email}
 
     # Redirect to the stored 'next_url' or the index
-    return redirect(session.pop("next_url", url_for("index")))
-
-
-@app.route("/login")
-def login():
-    """
-    The first part of the OAuth2 flow
-    Returns an authorisation URL provided by MSAL
-    Users log in at this URL, which redirects back to this app with:
-    - A code that can be exchanged for an authorization token
-    - The state set here (to prevent CSRF attacks)
-    """
-    app.logger.info(f"Login attempt for URL: {request.url}")
-
-    # Store the original URL in the session (from 'next' parameter or referer)
-    next_url = request.args.get("next") or request.referrer or url_for("index")
-
-    # Ensure the next_url is safe before proceeding
-    if not is_safe_url(next_url):
-        next_url = url_for("index")  # Default to index if the URL is unsafe
-
-    session["next_url"] = next_url
-    session["state"] = os.urandom(24).hex()
-
-    # Get the MSAL app and the token cache
-    msal_app, cache = get_msal_app()
-
-    auth_url = msal_app.get_authorization_request_url(
-        scopes=AZURE_SCOPE, redirect_uri=REDIRECT_URI, state=session["state"]
-    )
-
-    # Serialize and store the cache if it changed
-    if cache.has_state_changed:
-        session["token_cache"] = cache.serialize()
-
-    return redirect(auth_url)
+    next_url = validate_next(session.pop("next_url", None))
+    return redirect(next_url)
 
 
 @app.route("/logout")
 def logout():
-    session.clear()
-    logout_url = f"{AZURE_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('index', _external=True)}"
-    return redirect(logout_url)
+    # Check if the user is logged in by verifying if the 'user' key is in session
+    if is_authenticated():
+        # Remove the token and details from the session
+        session.clear()
+
+        # Access the MSAL app and clear cached accounts
+        msal_app = build_msal_app()
+        accounts = msal_app.get_accounts()
+
+        # Remove each account from the cache
+        for account in accounts:
+            msal_app.remove_account(account)
+
+        # Prevent browser caching of pages after logout
+        logout_url = f"{AZURE_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('landing', _external=True, t=int(time.time()))}&logout_hint={session.get('user', {}).get('email')}"
+
+        response = make_response(redirect(logout_url))
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+    # If the user is not logged in, redirect to the landing page
+    return redirect(url_for("landing", _external=True, t=int(time.time())))
 
 
 """
@@ -391,8 +645,6 @@ def get_auth_message(succeed=False):
     else:
         content = "Error: you are not authorised to access the CMS"
         message = "error"
-
-    print(message, content)
     return message, content
 
 
@@ -415,7 +667,7 @@ def proxy_request():
         return abort(403)  # Block unauthenticated users
 
     token = request.headers.get(
-        "X-CSRF-Token"
+        "X-CSRFToken"
     )  # Assuming the CSRF token is sent in the header
 
     if not token:
@@ -446,7 +698,7 @@ def proxy_request():
     headers.pop("Content-Length", None)
     headers.pop("Connection", None)
     headers.pop("Cookie", None)
-    headers.pop("X-CSRF-Token", None)
+    headers.pop("X-CSRFToken", None)
 
     # Handle body for non-GET methods (uploads)
     data = None
@@ -492,14 +744,14 @@ def proxy_request():
         return Response(
             content,
             status=response.status_code,
-            headers={"Content-Type": content_type, "X-CSRF-Token": new_csrf_token},
+            headers={"Content-Type": content_type, "X-CSRFToken": new_csrf_token},
         )
     else:
         # Return raw binary content (e.g., images)
         return Response(
             response.content,
             status=response.status_code,
-            headers={"Content-Type": content_type, "X-CSRF-Token": new_csrf_token},
+            headers={"Content-Type": content_type, "X-CSRFToken": new_csrf_token},
         )
 
 
@@ -537,18 +789,26 @@ Static Web App Routes
 @app.route("/apple-touch-icon.png")
 @app.route("/favicon-16x16.png")
 @app.route("/favicon-32x32.png")
+@app.route("/site.webmanifest")
+@app.route("/sitemap.xml")
 def serve_public_static_files():
     return send_from_directory(
         HUGO_PATH, request.path[1:]
     )  # Removes the leading '/' from the path
 
 
+@app.route("/landing")
+def landing():
+    return render_template("landing.html", welcome_message=LANDING_PAGE_MESSAGE)
+
+
 @app.route("/")
 def index():
     if app.debug or is_authenticated():
         return send_from_directory(HUGO_PATH, "index.html")
-    # Render the landing page if not authenticated
-    return render_template("landing.html")
+    else:
+        # For unauthenticated users, include a cache-busting query parameter
+        return redirect(url_for("landing", _external=True, t=int(time.time())))
 
 
 @app.route("/<path:path>")
