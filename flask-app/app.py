@@ -596,7 +596,7 @@ def logout():
             msal_app.remove_account(account)
 
         # Prevent browser caching of pages after logout
-        logout_url = f"{AZURE_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('landing', _external=True, t=int(time.time()))}&logout_hint={session.get('user', {}).get('email')}"
+        logout_url = f"{AZURE_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri={url_for('landing', _external=True)}&logout_hint={session.get('user', {}).get('email')}"
 
         response = make_response(redirect(logout_url))
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -605,7 +605,7 @@ def logout():
         return response
 
     # If the user is not logged in, redirect to the landing page
-    return redirect(url_for("landing", _external=True, t=int(time.time())))
+    return redirect(url_for("landing", _external=True))
 
 
 """
@@ -808,7 +808,7 @@ def index():
         return send_from_directory(HUGO_PATH, "index.html")
     else:
         # For unauthenticated users, include a cache-busting query parameter
-        return redirect(url_for("landing", _external=True, t=int(time.time())))
+        return redirect(url_for("landing", _external=True))
 
 
 @app.route("/<path:path>")
