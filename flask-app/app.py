@@ -117,7 +117,7 @@ Helper Functions
 def check_email_domain(user_email):
     # Check whether the email domain is in the allowed list
     for domain in ALLOWED_EMAIL_DOMAIN:
-        if user_email.ends_with(domain):
+        if user_email.endswith(domain):
             return True
     return False
 
@@ -605,6 +605,7 @@ def authorized():
         return "Invalid token issuer.", 403
 
     if id_token_claims.get("tid") != AZURE_TENANT_ID:
+        print(f"Unauthorized tenant: {id_token_claims.get("tid")}")
         return "Unauthorized tenant.", 403
 
     # UPN often contains the user email in Entra
