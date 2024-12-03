@@ -72,6 +72,7 @@ AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 AZURE_SCOPE = os.getenv("AZURE_SCOPE", "").split()
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")
+ALLOWED_TENANT_IDS = os.getenv("ALLOWED_TENANT_IDS").split(",")
 ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN").split(",")
 ALLOWED_GROUP_IDS = os.getenv("ALLOWED_GROUP_IDS", "").split(",")  # Optional
 CMS_ALLOWED_EMAILS = os.getenv("CMS_ALLOWED_EMAILS", "").split(
@@ -122,6 +123,15 @@ def check_email_domain(user_email):
     return False
 
 
+def check_tenant(tid):
+    # Check whether a tenant ID is allowed
+    if tid == AZURE_TENANT_ID:
+        return True
+    if tid in ALLOWED_TENANT_IDS:
+        return True
+    return False
+
+
 def is_authenticated():
     # If there is no token cache in the session, not authenticated
     token_cache = load_cache()
@@ -139,7 +149,7 @@ def is_authenticated():
         )
 
         # Only authenticated accounts will return a valid token
-        if "access_token" in token_response:
+        if token_response and "access_token" in token_response:
             return True  # User is authenticated
 
     return False  # Default to not authenticated
@@ -604,8 +614,9 @@ def authorized():
     ):
         return "Invalid token issuer.", 403
 
-    if id_token_claims.get("tid") != AZURE_TENANT_ID:
-        print(f"Unauthorized tenant: {id_token_claims.get("tid")}")
+    tenant_id = id_token_claims.get("tid")
+    if not check_tenant(tenant_id):
+        print(f"Unauthorized tenant: {tenant_id}")
         return "Unauthorized tenant.", 403
 
     # UPN often contains the user email in Entra
