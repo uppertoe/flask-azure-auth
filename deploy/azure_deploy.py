@@ -47,6 +47,7 @@ DOCKER_IMAGE_TAG = os.getenv("DOCKER_IMAGE_TAG")
 AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID")
 AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
+FRONT_CHANNEL_LOGOUT_URI = os.getenv("FRONT_CHANNEL_LOGOUT_URI")
 AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
 AZURE_FILE_SHARE_NAME = os.getenv("AZURE_FILE_SHARE_NAME")
 CUSTOM_DOMAIN = os.getenv("CUSTOM_DOMAIN")
@@ -1040,21 +1041,20 @@ def register_or_get_azure_ad_app():
         app_id = app_info["id"]
         print(f"Found existing Azure AD app with client_id: {client_id}")
 
-        # Ensure the redirect URI is up-to-date
-        current_redirect_uris = app_info.get("web", {}).get("redirectUris", [])
-        if REDIRECT_URI not in current_redirect_uris:
-            print("Updating redirect URIs...")
-            current_redirect_uris.append(REDIRECT_URI)
-            update_data = {"web": {"redirectUris": current_redirect_uris}}
-            update_url = f"https://graph.microsoft.com/v1.0/applications/{app_id}"
-            update_response = requests.patch(
-                update_url, headers=headers, json=update_data
+        # Update redirect URIs and front-channel logout URL (without checking)
+        update_data = {
+            "web": {
+                "redirectUris": [REDIRECT_URI],
+                "logoutUrl": FRONT_CHANNEL_LOGOUT_URI,
+            }
+        }
+        update_url = f"https://graph.microsoft.com/v1.0/applications/{app_id}"
+        update_response = requests.patch(update_url, headers=headers, json=update_data)
+        if update_response.status_code != 204:
+            raise Exception(
+                f"Failed to update redirect URIs or logout URL: {update_response.text}"
             )
-            if update_response.status_code != 204:
-                raise Exception(
-                    f"Failed to update redirect URIs: {update_response.text}"
-                )
-            print("Redirect URIs updated successfully.")
+        print("Redirect URIs and front-channel logout URL updated successfully.")
     else:
         print(
             f"No existing Azure AD app named '{AZURE_APP_NAME}' found. Creating a new one..."
@@ -1062,7 +1062,10 @@ def register_or_get_azure_ad_app():
         app_data = {
             "displayName": AZURE_APP_NAME,
             "signInAudience": "AzureADMyOrg",  # Single tenant
-            "web": {"redirectUris": [REDIRECT_URI]},
+            "web": {
+                "redirectUris": [REDIRECT_URI],
+                "logoutUrl": FRONT_CHANNEL_LOGOUT_URI,
+            },
         }
 
         response = requests.post(
@@ -1112,7 +1115,7 @@ def create_service_principal():
     client_secret = sp_info["clientSecret"]
     print(f"Service Principal created with client_id: {client_id}")
 
-    # Assign "SStorage File Data Privileged Contributor" role to the service principal for REST API access
+    # Assign "Storage File Data Privileged Contributor" role to the service principal for REST API access
     print(
         f"Assigning Storage File Data Privileged Contributor role to {AZURE_APP_NAME} for file share REST API access..."
     )

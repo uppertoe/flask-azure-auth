@@ -204,3 +204,7 @@ cython_debug/
 
 # CLI logs
 deploy/logs/
+
+green/
+blue/
+state/

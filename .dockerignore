@@ -102,3 +102,7 @@ flask-app/**/*.pyo
 flask-app/**/*.pyd
 
 flask-app/*.pem
+
+green/
+blue/
+state/

@@ -1,0 +1,160 @@
+name: Build and Deploy Hugo to Azure Container App
+
+on:
+  push:
+    branches:
+      - main  # Change to your default branch if different
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+
+jobs:
+  # Build Job
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: "build-azure-webapp"
+      cancel-in-progress: true  # Allow canceling in-progress builds
+    env:
+      HUGO_VERSION: 0.135.0  # Specify your desired Hugo version
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Install Hugo CLI
+        run: |
+          wget -O ${{ runner.temp }}/hugo.deb https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_linux-amd64.deb
+          sudo dpkg -i ${{ runner.temp }}/hugo.deb
+
+      - name: Install Dart Sass
+        run: sudo snap install dart-sass
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Node.js Dependencies
+        run: |
+          [[ -f package-lock.json || -f npm-shrinkwrap.json ]] && npm ci || true
+
+      - name: Build with Hugo
+        env:
+          HUGO_CACHEDIR: ${{ runner.temp }}/hugo_cache
+          HUGO_ENVIRONMENT: production
+          TZ: America/Los_Angeles
+        run: |
+          hugo \
+            --gc \
+            --minify
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy
+          path: public/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: "deploy-azure-webapp"
+      cancel-in-progress: false  # Prevent canceling in-progress deploys
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy
+          path: public/
+
+      # Parse secrets from AZURE_CREDENTIALS and export as environment variables
+      - name: Parse secrets from JSON and export environment variables
+        run: |
+          AZURE_CLIENT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r '.clientId')
+          AZURE_CLIENT_SECRET=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r '.clientSecret')
+          AZURE_TENANT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r '.tenantId')
+
+          echo "AZCOPY_SPA_APPLICATION_ID=$AZURE_CLIENT_ID" >> $GITHUB_ENV
+          echo "AZCOPY_SPA_CLIENT_SECRET=$AZURE_CLIENT_SECRET" >> $GITHUB_ENV
+          echo "AZCOPY_TENANT_ID=$AZURE_TENANT_ID" >> $GITHUB_ENV
+          echo "AZCOPY_AUTO_LOGIN_TYPE=SPN" >> $GITHUB_ENV
+
+      - name: Install azcopy
+        run: |
+          UBUNTU_VERSION=$(lsb_release -rs)
+          wget -O packages-microsoft-prod.deb https://packages.microsoft.com/config/ubuntu/${UBUNTU_VERSION}/packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update
+          sudo apt-get install -y azcopy
+
+      - name: Check current site version
+        id: check_version
+        run: |
+          # Use curl to get the current version and store the session cookie
+          CURRENT_VERSION=$(curl -s "${{ secrets.WEBHOOK_URL }}${{ secrets.WEBHOOK_CURRENT_SERVE_DIRECTORY }}")
+          
+          # Output the current version (for debugging purposes)
+          echo "Current version is: $CURRENT_VERSION"
+          
+          # Ensure that the value is correct
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "Error: CURRENT_VERSION is empty!"
+            exit 1
+          fi
+          
+          # Set the output for use in other steps
+          echo "CURRENT_VERSION=$CURRENT_VERSION" >> $GITHUB_ENV
+
+      - name: Remove files from the other folder
+        run: |
+          # Clear the contents of the other folder
+          if [ "$CURRENT_VERSION" == "blue" ]; then
+            echo "Clearing the green folder"
+            azcopy remove "https://${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}.file.core.windows.net/${{ secrets.AZURE_FILE_SHARE_NAME }}/green/*" --recursive
+          elif [ "$CURRENT_VERSION" == "green" ]; then
+            echo "Clearing the blue folder"
+            azcopy remove "https://${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}.file.core.windows.net/${{ secrets.AZURE_FILE_SHARE_NAME }}/blue/*" --recursive
+          else
+            echo "Unknown version: $CURRENT_VERSION"
+            exit 1
+          fi
+      
+      - name: Deploy to the other version
+        run: |
+          # Compare the current version and deploy to the other one
+          if [ "$CURRENT_VERSION" == "blue" ]; then
+            echo "Deploying to green version"
+            azcopy copy "public/*" "https://${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}.file.core.windows.net/${{ secrets.AZURE_FILE_SHARE_NAME }}/green/" --recursive=true --overwrite=true
+          elif [ "$CURRENT_VERSION" == "green" ]; then
+            echo "Deploying to blue version"
+            azcopy copy "public/*" "https://${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}.file.core.windows.net/${{ secrets.AZURE_FILE_SHARE_NAME }}/blue/" --recursive=true --overwrite=true
+          else
+            echo "Unknown version: $CURRENT_VERSION"
+            exit 1
+          fi
+
+      - name: Toggle the site version
+        run: |
+          # Use curl to toggle the site version, passing the CSRF token and session cookie
+          HTTP_RESPONSE=$(curl -w "%{http_code}" -X POST \
+            -H "X-Webhook-Password: ${{ secrets.WORKFLOW_TOKEN }}" \
+            -o response.txt \
+            "${{ secrets.WEBHOOK_URL }}${{ secrets.WEBHOOK_TOGGLE_SERVE_DIRECTORY }}")
+
+          # Extract the body from the response file
+          CURRENT_VERSION=$(cat response.txt)
+
+          # Output the current version (for debugging purposes)
+          echo "Current version is $CURRENT_VERSION"
+
+          # Check if the HTTP response code is 200
+          if [ "$HTTP_RESPONSE" -ne 200 ]; then
+            echo "Failed to toggle the site version. HTTP Status: $HTTP_RESPONSE"
+            exit 1
+          fi

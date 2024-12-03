@@ -7,7 +7,7 @@ import string
 import secrets
 import time
 import uuid
-import fcntl
+import random
 import msal
 from flask import (
     Flask,
@@ -38,7 +38,7 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 """
 Initialise Flask
 """
-# Load .env only in development
+# Load .env for local dev
 load_dotenv(".env")
 
 # Initialize the Flask app
@@ -72,17 +72,19 @@ AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 AZURE_SCOPE = os.getenv("AZURE_SCOPE", "").split()
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")
-ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN")
-ALLOWED_GROUP_IDS = os.getenv("ALLOWED_GROUP_IDS", "").split(",")
-CMS_ALLOWED_EMAILS = os.getenv("CMS_ALLOWED_EMAILS", "").split(",")
-CMS_GITHUB_TOKEN = os.getenv("CMS_GITHUB_TOKEN")
-GITHUB_SECRETS_TOKEN = os.getenv("GITHUB_SECRETS_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
-
-# Set other variables
+ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN").split(",")
+ALLOWED_GROUP_IDS = os.getenv("ALLOWED_GROUP_IDS", "").split(",")  # Optional
+CMS_ALLOWED_EMAILS = os.getenv("CMS_ALLOWED_EMAILS", "").split(
+    ","
+)  # Users allowed access to CMS
+CMS_GITHUB_TOKEN = os.getenv("CMS_GITHUB_TOKEN")  # Requires repo read/write permissions
+GITHUB_SECRETS_TOKEN = os.getenv("GITHUB_SECRETS_TOKEN")  # Requires secrets permisions
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # username/repo
 AZURE_AUTHORITY = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
-MOUNT_PATH = "" if app.debug else os.getenv("MOUNT_PATH", "/mnt")
-SESSION_PATH = "flask_sessions"
+MOUNT_PATH = (
+    "" if app.debug else os.getenv("MOUNT_PATH", "/mnt")
+)  # Path to mounted container volume
+SESSION_PATH = f"{MOUNT_PATH}/flask_sessions"  # Ephemeral unless at mounted volume
 SESSION_LIFETIME_DAYS = int(os.getenv("SESSION_LIFETIME_DAYS", 7))
 LANDING_PAGE_MESSAGE = os.getenv(
     "LANDING_PAGE_MESSAGE", "Welcome to the Flask Authentication App"
@@ -92,19 +94,32 @@ LANDING_PAGE_MESSAGE = os.getenv(
 """
 Initialise Session
 """
-# Configure Flask-Session to use the file system
-app.config["SESSION_TYPE"] = "filesystem"  # Use file system for sessions
+# Flask-Session to implement server-side sessions
+# Entra access tokens are larger than permissible by client-side cookies
+# Keeping these server-side simplifies handling of sensitive tokens
+app.config["SESSION_TYPE"] = "filesystem"  # Filesystem
 app.config["SESSION_FILE_DIR"] = SESSION_PATH  # Directory for session files
 app.config["SESSION_PERMANENT"] = True  # Permanent session
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
     days=SESSION_LIFETIME_DAYS
 )  # Session lasts 7 days
+
+# Client cookie contains session_id to retrieve server-side session
 SESSION_COOKIE_NAME = app.config.get("SESSION_COOKIE_NAME", "session")
+
 Session(app)
 
 """
 Helper Functions
 """
+
+
+def check_email_domain(user_email):
+    # Check whether the email domain is in the allowed list
+    for domain in ALLOWED_EMAIL_DOMAIN:
+        if user_email.ends_with(domain):
+            return True
+    return False
 
 
 def is_authenticated():
@@ -113,8 +128,8 @@ def is_authenticated():
     if not token_cache:
         return False
 
-    # Calls load_cache
-    msal_app = build_msal_app()
+    # Get the signed-in accounts
+    msal_app = build_msal_app()  # Calls load_cache
     accounts = msal_app.get_accounts()
 
     if accounts:
@@ -123,16 +138,21 @@ def is_authenticated():
             account=accounts[0],  # Use the first account in the cache
         )
 
+        # Only authenticated accounts will return a valid token
         if "access_token" in token_response:
             return True  # User is authenticated
 
-    return False
+    return False  # Default to not authenticated
 
 
 def cms_is_authenticated():
     """Check if the user is authenticated by verifying their email in the session"""
-    user_email = session.get("user", {}).get("email")
-    return user_email in CMS_ALLOWED_EMAILS and is_authenticated()
+    user_email = session.get("user", {}).get(
+        "email"
+    )  # From verified claims when logged in
+    return (
+        user_email in CMS_ALLOWED_EMAILS and is_authenticated()
+    )  # Ensure is authenticated
 
 
 def is_safe_url(target):
@@ -154,13 +174,16 @@ def check_https():
     if not app.debug:
         # Allow HTTP for internal health check requests
         if request.path == "/liveness":
-            return None  # Bypass HTTPS enforcement for the probe
+            return None  # Bypass HTTPS enforcement for the probe within the container
         elif request.headers.get("X-Forwarded-Proto", "http") != "https":
             return redirect(request.url.replace("http://", "https://"))
 
 
 @app.after_request
 def set_security_headers(response):
+    """
+    Allow specific scripts relating to CMS use
+    """
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "connect-src 'self' https://api.github.com https://www.githubstatus.com;"  # Allow CMS github access
@@ -199,6 +222,22 @@ def add_cache_headers(response):
 
 """
 Webhooks
+These define routes by which the Github Workflow can manage the zero-downtime deployment of the static site.
+There are two webhooks:
+- Current state: which returns whether the 'blue' or the 'green' deployment of the static site is in current use
+- Toggle state: which switches the active deployment
+
+Zero downtime SSG deployment
+- The Github Workflow deploys a website revision to the non-active directory
+- Once copied, Flask is informed via the webhook to switch via the HUGO_PATH variable
+
+Security:
+- The webhook URLs are random strings set by environment variables
+- The toggle webhook is further protected by a single-use password, which the Github Workflow accesses via secrets
+
+State across multiple workers:
+- The blue or green deployment status is saved to a file on the mounted volume.
+- For Gunicorn workers to register a change, a scheduled task reads the file periodically
 """
 
 
@@ -222,16 +261,17 @@ WEBHOOK_CURRENT_SERVE_DIRECTORY = os.getenv(
 WEBHOOK_TOGGLE_SERVE_DIRECTORY = os.getenv(
     "WEBHOOK_TOGGLE_SERVE_DIRECTORY", generate_random_webhook_secret()
 )
-PASSWORD_FILE = os.path.join(MOUNT_PATH, "state/github_password.txt")
-PASSWORD_LIFETIME = 3600  # 1 hour in seconds
 
-if app.debug:
-    print(
-        f"curl -v -c cookies.txt -X GET http://127.0.0.1:8000/webhook/{WEBHOOK_CURRENT_SERVE_DIRECTORY}"
-    )
-    print(
-        f"Toggle webhook at http://127.0.0.1:8000/webhook/{WEBHOOK_TOGGLE_SERVE_DIRECTORY}"
-    )
+# Github Toggle webook password
+PASSWORD_FILE = os.path.join(MOUNT_PATH, "state/github_password.txt")
+LOCK_FILE = PASSWORD_FILE + ".lock"
+PASSWORD_LIFETIME = 3600  # 1 hour
+JITTER_RANGE = 0.1  # Jitter range in seconds (100 milliseconds)
+
+
+"""
+Set up directory structure on deploy
+"""
 
 
 def ensure_directory_exists(path):
@@ -257,8 +297,7 @@ ensure_directory_exists(GREEN_DIR)
 ensure_directory_exists(BLUE_DIR)
 ensure_directory_exists(SERVE_DIRECTORY_STATE_PATH)
 ensure_file_exists(SERVE_DIRECTORY_STATE_PATH)
-# Password directory in state/
-ensure_file_exists(PASSWORD_FILE)
+ensure_file_exists(PASSWORD_FILE)  # state/ directory already created
 
 
 def check_current_serve_directory():
@@ -268,7 +307,7 @@ def check_current_serve_directory():
 
         # Set the starting value if empty
         if content not in ["blue", "green"]:
-            content = "green"
+            content = "green"  # Default to green
             with open(SERVE_DIRECTORY_STATE_PATH, "w") as file:  # overwrite
                 file.write(content)
 
@@ -297,80 +336,85 @@ def toggle_current_serve_directory():
         return new_content.strip().lower()
 
 
-# Read password and timestamp from file with non-blocking locking
+"""Github password handling for toggle webhook"""
+
+
 def read_password_file():
+    """Reads the password and timestamp from the file if it exists."""
     if not os.path.exists(PASSWORD_FILE):
-        return None, 0  # Return default values if file doesn't exist
+        ensure_directory_exists(PASSWORD_FILE)
+        return None, 0  # File doesn't exist yet
 
     try:
         with open(PASSWORD_FILE, "r") as f:
-            # Try to acquire a shared lock in non-blocking mode
-            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
             content = f.read().strip()
-            fcntl.flock(f, fcntl.LOCK_UN)  # Release the lock
             if content:
                 password, timestamp = content.split(":")
                 return password, float(timestamp)
-    except BlockingIOError:
-        # Another worker is holding the lock, so we abandon the operation
-        app.logger.info(
-            "Password file is locked by another worker. Abandoning password generation."
-        )
+    except Exception as e:
+        app.logger.warning(f"Failed to read password file: {e}")
         return None, 0
 
     return None, 0
 
 
-# Write new password and timestamp to file with non-blocking locking
 def write_password_file(password, timestamp):
+    """Writes a new password and timestamp to the password file."""
     try:
         with open(PASSWORD_FILE, "w") as f:
-            # Try to acquire an exclusive lock in non-blocking mode
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             f.write(f"{password}:{timestamp}")
-            fcntl.flock(f, fcntl.LOCK_UN)  # Release the lock
-    except BlockingIOError:
-        # Another worker is holding the lock, abandon the write
-        app.logger.info(
-            "Password file is locked by another worker. Abandoning write operation."
-        )
-        abort(500, description="Failed to update the password due to file lock.")
+    except Exception as e:
+        app.logger.warning(f"Failed to write password file: {e}")
 
 
-# Generate a new password and update the file if older than 1 hour
-# Return a flag indicating whether the password was updated
 def generate_or_refresh_password(force=False):
+    """Generates a new password if the existing one is stale or if forced."""
     current_time = time.time()
     password, timestamp = read_password_file()
 
-    if password is None:
-        # File is locked, abandon the operation
-        return None, False
+    # Check if password is expired
+    if force or current_time - timestamp > PASSWORD_LIFETIME:
+        # Add a small jitter before attempting to create the lock file
+        time.sleep(random.uniform(0, JITTER_RANGE))
 
-    if (
-        current_time - timestamp > PASSWORD_LIFETIME or force
-    ):  # If password is older than 1 hour
-        new_password = str(uuid.uuid4())  # Generate a new password
-        write_password_file(
-            new_password, current_time
-        )  # Update the file with new password
-        return (
-            new_password,
-            True,
-        )  # Return the updated password and True (password changed)
+        # Attempt to create lock file exclusively
+        # Prevents a race condition between workers
+        try:
+            with open(LOCK_FILE, "x") as lock:
+                # Successfully created lock file; now update password
+                app.logger.info("Lock file created; password update proceeding")
+                new_password = str(uuid.uuid4())
+                write_password_file(new_password, current_time)
+                os.remove(LOCK_FILE)  # Remove the lock file after updating
+                return new_password, True  # Password updated
+        except FileExistsError:
+            # Another worker has the lock; let it handle the update
+            app.logger.info("Lock file exists; no update required")
+            return password, False  # No update needed by this worker
 
-    return password, False  # Return the existing password and False (no change)
+    return password, False  # No update needed, password valid
 
 
 # Send the password to GitHub Secrets
 def update_github_secret(password):
+    # Send the password to Github secrets
     secret_updater = GitHubSecretUpdater(
         GITHUB_REPO, GITHUB_SECRETS_TOKEN, debug=app.debug
     )
     secret_updater.update_secret("WORKFLOW_TOKEN", password)
 
 
-# Set the HUGO_PATH variable
+# On Flask app start, ensure password is up-to-date
+def initialise_password():
+    password, changed = generate_or_refresh_password(force=True)
+    if changed:
+        update_github_secret(password)
+
+
+initialise_password()  # Initialise on app start
+
+
+# Set the HUGO_PATH variable according to the deploy version
 def set_hugo_path():
     if app.debug:
         path = os.path.join(MOUNT_PATH, "public")
@@ -379,7 +423,7 @@ def set_hugo_path():
     return path
 
 
-HUGO_PATH = set_hugo_path()
+HUGO_PATH = set_hugo_path()  # On app start
 
 
 # Periodically check whether the HUGO_PATH has been updated
@@ -397,11 +441,13 @@ def start_scheduler():
     scheduler.start()
 
 
+# Start on app load
 start_scheduler()
 
 
 @app.route(f"/webhook/{WEBHOOK_CURRENT_SERVE_DIRECTORY}")
 def current_state():
+    """Returns the current deploy directory as plain text"""
     current_directory = check_current_serve_directory()
     return current_directory, 200
 
@@ -409,32 +455,30 @@ def current_state():
 @app.route(f"/webhook/{WEBHOOK_TOGGLE_SERVE_DIRECTORY}", methods=["POST"])
 @csrf.exempt
 def toggle_state():
+    """
+    Toggles the deploy directory if the password header matches
+    Re-sends the password to github secrets if incorrect (to fix a sync issue if exists)
+    Refreshes the password on success if expired
+    Returns the final deploy directory as plain text
+    """
     request_password = request.headers.get("X-Webhook-Password")
     password, _ = read_password_file()
 
-    if password and password == request_password:
-        # Toggle the serve directory
-        current_directory = toggle_current_serve_directory()
-    else:
-        update_github_secret(password)
-        return jsonify({"error": "Invalid Github Workflow token"}), 403
+    if password:
+        if password == request_password:
+            # Toggle the serve directory
+            current_directory = toggle_current_serve_directory()
+        else:
+            update_github_secret(password)  # Ensure passwords are in sync
+            return jsonify({"error": "Invalid Github Workflow token"}), 403
 
     # Refresh the password
-    new_password, changed = generate_or_refresh_password(force=True)
+    new_password, changed = generate_or_refresh_password()
     if changed:
         update_github_secret(new_password)
 
     return current_directory, 200
 
-
-# On Flask app start, ensure password is up-to-date
-def initialise_password():
-    password, changed = generate_or_refresh_password()
-    if changed:
-        update_github_secret(password)
-
-
-initialise_password()
 
 """
 MSAL Authentication Flow
@@ -442,7 +486,7 @@ MSAL Authentication Flow
 
 
 def load_cache():
-    # Load the cache from the session
+    # Load the cache from the server-side session
     cache = msal.SerializableTokenCache()
     if "token_cache" in session:
         cache.deserialize(session["token_cache"])
@@ -456,7 +500,7 @@ def save_cache(cache):
 
 
 def build_msal_app():
-    # Initialize the MSAL app with the token cache
+    # Initialize the MSAL app; calls load_cache to retrieve or initialise the cache
     cache = load_cache()
     msal_app = msal.ConfidentialClientApplication(
         AZURE_CLIENT_ID,
@@ -469,6 +513,8 @@ def build_msal_app():
 
 
 def validate_next(next_url):
+    """Ensure the url passed is safe and is not the landing page
+    Defaults to returning the index"""
     if next_url:
         # Ensure the URL is relative
         parsed_url = urlparse(next_url)
@@ -495,13 +541,14 @@ def login():
     next_url = request.args.get("next") or request.referrer or None
 
     # Validate the next_url
-    next_url = validate_next(next_url)
+    next_url = validate_next(next_url)  # Returns url_for(index) if not validated
     session["next_url"] = next_url
 
-    msal_app = build_msal_app()
+    msal_app = build_msal_app()  # Includes loading from cache
     nonce = secrets.token_urlsafe(16)  # Generates a URL-safe, random string
-    session["state"] = nonce
+    session["state"] = nonce  # Set the state for CSRF protection
 
+    # Retrieves a URL from Entra where the user can login
     auth_url = msal_app.get_authorization_request_url(
         scopes=AZURE_SCOPE, redirect_uri=REDIRECT_URI, state=nonce
     )
@@ -532,7 +579,7 @@ def authorized():
     if not code:
         abort(400, description="Authorization code not found.")
 
-    """Get the access token"""
+    """Get the access token using the code returned by the first part of the flow"""
     # Get the MSAL app and acquire the token
     msal_app = build_msal_app()
     token_response = msal_app.acquire_token_by_authorization_code(
@@ -560,8 +607,10 @@ def authorized():
     if id_token_claims.get("tid") != AZURE_TENANT_ID:
         return "Unauthorized tenant.", 403
 
+    # UPN often contains the user email in Entra
     user_email = id_token_claims.get("email") or id_token_claims.get("upn")
-    if not user_email or not user_email.endswith(ALLOWED_EMAIL_DOMAIN):
+    domain_allowed = check_email_domain(user_email)
+    if not user_email or not domain_allowed:
         return "Unauthorized user.", 403
 
     user_groups = id_token_claims.get("groups", [])
@@ -807,8 +856,8 @@ def index():
     if app.debug or is_authenticated():
         return send_from_directory(HUGO_PATH, "index.html")
     else:
-        # For unauthenticated users, include a cache-busting query parameter
-        return redirect(url_for("landing", _external=True))
+        # For unauthenticated users
+        return redirect(url_for("landing"))
 
 
 @app.route("/<path:path>")
